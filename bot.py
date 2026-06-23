@@ -3026,32 +3026,37 @@ def main():
 
     if WEBHOOK_URL:
         # ── Webhook mode (Render / any public HTTPS host) ─────────────────────
-        # WEBHOOK_URL must be set to your Render service URL, e.g.:
-        #   https://tg-market-bot.onrender.com
         import asyncio
         import signal
 
         async def run():
             logger.info(f"🚀 Starting bot in webhook mode on port {PORT}...")
-            async with ptb_app:
-                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-                await ptb_app.start()
-                await ptb_app.updater.start_webhook(
-                    listen="0.0.0.0",
-                    port=PORT,
-                    url_path=BOT_TOKEN,
-                    webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-                    drop_pending_updates=True,
-                    allowed_updates=["message", "callback_query"],
-                )
-                logger.info(f"✅ Webhook set: {WEBHOOK_URL}/{BOT_TOKEN}")
-                stop_event = asyncio.Event()
-                loop = asyncio.get_running_loop()
-                for sig in (signal.SIGINT, signal.SIGTERM):
+            await ptb_app.initialize()
+            await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+            await ptb_app.start()
+            await ptb_app.updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+            )
+            logger.info(f"✅ Webhook active: {WEBHOOK_URL}/{BOT_TOKEN}")
+
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
                     loop.add_signal_handler(sig, stop_event.set)
-                await stop_event.wait()
-                await ptb_app.updater.stop()
-                await ptb_app.stop()
+                except NotImplementedError:
+                    pass  # Windows doesn't support add_signal_handler
+            await stop_event.wait()
+
+            logger.info("🛑 Shutting down...")
+            await ptb_app.updater.stop()
+            await ptb_app.stop()
+            await ptb_app.shutdown()
 
         asyncio.run(run())
 
@@ -3079,21 +3084,27 @@ def main():
 
         async def run():
             logger.info("🚀 Starting bot in polling mode (local)...")
-            async with ptb_app:
-                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-                await ptb_app.start()
-                await ptb_app.updater.start_polling(
-                    allowed_updates=["message", "callback_query"],
-                    drop_pending_updates=True,
-                )
-                logger.info("✅ Bot is running. Press Ctrl+C to stop.")
-                stop_event = asyncio.Event()
-                loop = asyncio.get_running_loop()
-                for sig in (signal.SIGINT, signal.SIGTERM):
+            await ptb_app.initialize()
+            await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+            await ptb_app.start()
+            await ptb_app.updater.start_polling(
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+            logger.info("✅ Bot is running. Press Ctrl+C to stop.")
+            stop_event = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
                     loop.add_signal_handler(sig, stop_event.set)
-                await stop_event.wait()
-                await ptb_app.updater.stop()
-                await ptb_app.stop()
+                except NotImplementedError:
+                    pass
+            await stop_event.wait()
+
+            logger.info("🛑 Shutting down...")
+            await ptb_app.updater.stop()
+            await ptb_app.stop()
+            await ptb_app.shutdown()
 
         asyncio.run(run())
 
