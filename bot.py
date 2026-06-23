@@ -263,6 +263,30 @@ def init_db():
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         conn.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS upi_id TEXT DEFAULT ''")
+
+        # ── Sequence continuity across database resets ────────────────────────
+        # Set STARTING_ACCOUNT_ID / STARTING_DEPOSIT_ID / STARTING_WITHDRAWAL_ID
+        # in your Render env vars so IDs continue from where the last DB left off.
+        # Example: if your last account ID was 47, set STARTING_ACCOUNT_ID=48
+        for env_var, sequence in (
+            ("STARTING_ACCOUNT_ID",    "accounts_id_seq"),
+            ("STARTING_DEPOSIT_ID",    "deposits_id_seq"),
+            ("STARTING_WITHDRAWAL_ID", "withdrawals_id_seq"),
+        ):
+            raw = os.getenv(env_var, "").strip()
+            if raw:
+                try:
+                    start_val = int(raw)
+                    if start_val > 1:
+                        # setval(seq, val, is_called=false) → next INSERT gets exactly val
+                        conn.execute(
+                            "SELECT setval(%s, %s, false)",
+                            (sequence, start_val)
+                        )
+                        logger.info(f"✅ Sequence {sequence} starting from {start_val}")
+                except (ValueError, Exception) as e:
+                    logger.warning(f"Could not set sequence {sequence} from {env_var}: {e}")
+
     logger.info("✅ Database initialised.")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2535,7 +2559,7 @@ async def ap_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ap_list_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin panel → All Accounts."""
+    """Admin panel → All Accounts with per-account Edit Price buttons."""
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
         await query.answer("Not authorised.", show_alert=True); return
@@ -2554,24 +2578,106 @@ async def ap_list_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     icons = {"available": "🟢", "sold": "✅", "pending_review": "🔄"}
     lines = [f"<b>📦 Accounts (latest 30)</b>\n<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>"]
+    buttons = []
     for r in rows:
         flag, _ = phone_to_country(r["phone"] or "")
         icon = icons.get(r["status"], "⚪")
-        line = f"{icon} <b>#{r['id']}</b> {flag} <code>{mask_phone(r['phone'] or '')}</code> — <b>{fmt(r['price'])}</b> [{r['status']}]"
+        line = (f"{icon} <b>#{r['id']}</b> {flag} <code>{mask_phone(r['phone'] or '')}</code>"
+                f" — <b>{fmt(r['price'])}</b> [{r['status']}]")
         if r["buyer_id"]:
             line += f" → <code>{r['buyer_id']}</code>"
         lines.append(line)
+        # Show Edit Price button only for available accounts
+        if r["status"] == "available":
+            buttons.append([InlineKeyboardButton(
+                f"✏️ Edit Price  #{r['id']}  ({fmt(r['price'])})",
+                callback_data=f"acc_editprice_{r['id']}"
+            )])
 
     text = "\n".join(lines)
-    if len(text) > 3800:
-        text = text[:3800] + "\n\n<i>... truncated</i>"
+    if len(text) > 3500:
+        text = text[:3500] + "\n\n<i>... truncated</i>"
 
+    buttons.append([InlineKeyboardButton("🔙 Back to Panel", callback_data="admin_panel")])
     await query.edit_message_text(
         text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+# ── Admin: edit account price ─────────────────────────────────────────────────
+ACC_EDIT_PRICE = 20   # conversation state
+
+async def acc_editprice_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin taps ✏️ Edit Price on an account."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Not authorised.", show_alert=True); return
+    await query.answer()
+    acc_id = int(query.data.split("acc_editprice_")[1])
+    with get_db() as conn:
+        acc = conn.execute(
+            "SELECT id, phone, price FROM accounts WHERE id=%s AND status='available'", (acc_id,)
+        ).fetchone()
+    if not acc:
+        await query.answer("Account not found or no longer available.", show_alert=True); return
+    ctx.user_data["acc_edit_id"] = acc_id
+    flag, country = phone_to_country(acc["phone"] or "")
+    await query.edit_message_text(
+        f"<b>✏️ EDIT ACCOUNT PRICE</b>\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+        f"<b>🆔 Account:</b> <code>#{acc_id}</code>\n"
+        f"<b>🌍 Country:</b> {flag} {country}\n"
+        f"<b>📱 Phone:</b> <code>{mask_phone(acc['phone'] or '')}</code>\n"
+        f"<b>💵 Current Price:</b> {fmt(acc['price'])}\n\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+        f"Enter the new price in <b>USD</b> (e.g. <code>5.00</code>):\n\n"
+        f"Send /apcancel to go back.",
+        parse_mode="HTML"
+    )
+    return ACC_EDIT_PRICE
+
+async def acc_editprice_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin sent new price for an account."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    acc_id = ctx.user_data.get("acc_edit_id")
+    if not acc_id:
+        await update.message.reply_text("❌ No account selected. Use the Edit Price button.")
+        return ConversationHandler.END
+    try:
+        new_price = float(update.message.text.strip().replace("$", ""))
+        if new_price <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid price. Enter a positive number like <code>5.00</code>",
+            parse_mode="HTML")
+        return ACC_EDIT_PRICE
+
+    with get_db() as conn:
+        acc = conn.execute("SELECT * FROM accounts WHERE id=%s", (acc_id,)).fetchone()
+        if not acc:
+            await update.message.reply_text(f"❌ Account #{acc_id} not found.")
+            return ConversationHandler.END
+        old_price = acc["price"]
+        conn.execute("UPDATE accounts SET price=%s WHERE id=%s", (new_price, acc_id))
+
+    ctx.user_data.pop("acc_edit_id", None)
+    flag, country = phone_to_country(acc["phone"] or "")
+    await update.message.reply_text(
+        f"<b>✅ Price Updated!</b>\n\n"
+        f"<b>🆔 Account:</b> <code>#{acc_id}</code>\n"
+        f"<b>🌍</b> {flag} {country}\n"
+        f"<b>📱</b> <code>{mask_phone(acc['phone'] or '')}</code>\n"
+        f"<b>💵 Old Price:</b> {fmt(old_price)}\n"
+        f"<b>💵 New Price:</b> {fmt(new_price)}",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back to Panel", callback_data="admin_panel")]
+            [InlineKeyboardButton("📦 Back to Accounts", callback_data="ap_list_accounts")],
+            [InlineKeyboardButton("🔙 Back to Panel",    callback_data="admin_panel")],
         ])
     )
+    return ConversationHandler.END
 
 async def ap_pending_sells(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin panel → Pending sell submissions."""
@@ -2838,6 +2944,18 @@ def build_app() -> Application:
         per_message=False,
         allow_reentry=True,
     )
+    # Admin account price edit conversation
+    acc_editprice_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(acc_editprice_start, pattern=r"^acc_editprice_\d+$")],
+        states={
+            ACC_EDIT_PRICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), acc_editprice_save)
+            ],
+        },
+        fallbacks=[CommandHandler("apcancel", ap_cancel)],
+        per_message=False,
+        allow_reentry=True,
+    )
     app.add_handler(CommandHandler("start",    start))
     app.add_handler(CallbackQueryHandler(check_joined_cb, pattern="^check_joined$"))
     # ── Admin Panel ──────────────────────────────────────────────────────────
@@ -2856,6 +2974,7 @@ def build_app() -> Application:
     app.add_handler(login_conv)
     app.add_handler(sell_conv)
     app.add_handler(sell_approve_conv)
+    app.add_handler(acc_editprice_conv)
     app.add_handler(apanel_conv)
     app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("accounts",    admin_accounts))
@@ -2903,47 +3022,80 @@ def main():
     init_db()
     ptb_app = build_app()
 
-    import asyncio
-    import signal
-    import threading
-    from http.server import HTTPServer, BaseHTTPRequestHandler
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
 
-    # Minimal HTTP server so Render sees an open port
-    class HealthHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-        def log_message(self, *args):
-            pass  # suppress access logs
+    if WEBHOOK_URL:
+        # ── Webhook mode (Render / any public HTTPS host) ─────────────────────
+        # WEBHOOK_URL must be set to your Render service URL, e.g.:
+        #   https://tg-market-bot.onrender.com
+        import asyncio
+        import signal
 
-    def run_health_server():
-        server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-        server.serve_forever()
+        async def run():
+            logger.info(f"🚀 Starting bot in webhook mode on port {PORT}...")
+            async with ptb_app:
+                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+                await ptb_app.start()
+                await ptb_app.updater.start_webhook(
+                    listen="0.0.0.0",
+                    port=PORT,
+                    url_path=BOT_TOKEN,
+                    webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+                    drop_pending_updates=True,
+                    allowed_updates=["message", "callback_query"],
+                )
+                logger.info(f"✅ Webhook set: {WEBHOOK_URL}/{BOT_TOKEN}")
+                stop_event = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, stop_event.set)
+                await stop_event.wait()
+                await ptb_app.updater.stop()
+                await ptb_app.stop()
 
-    threading.Thread(target=run_health_server, daemon=True).start()
-    logger.info(f"Health check server running on port {PORT}")
+        asyncio.run(run())
 
-    async def run():
-        logger.info("🚀 Starting bot in polling mode...")
-        async with ptb_app:
-            await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-            await ptb_app.start()
-            await ptb_app.updater.start_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-            )
-            logger.info("✅ Bot is running. Press Ctrl+C to stop.")
-            # Keep running until SIGINT or SIGTERM
-            stop_event = asyncio.Event()
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, stop_event.set)
-            await stop_event.wait()
-            await ptb_app.updater.stop()
-            await ptb_app.stop()
+    else:
+        # ── Polling mode (local development only) ─────────────────────────────
+        import asyncio
+        import signal
+        import threading
+        from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    asyncio.run(run())
+        # Minimal health-check server so a local run still binds the port
+        class HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            def log_message(self, *args):
+                pass
+
+        threading.Thread(
+            target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
+            daemon=True,
+        ).start()
+        logger.info(f"Health check server running on port {PORT}")
+
+        async def run():
+            logger.info("🚀 Starting bot in polling mode (local)...")
+            async with ptb_app:
+                await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+                await ptb_app.start()
+                await ptb_app.updater.start_polling(
+                    allowed_updates=["message", "callback_query"],
+                    drop_pending_updates=True,
+                )
+                logger.info("✅ Bot is running. Press Ctrl+C to stop.")
+                stop_event = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    loop.add_signal_handler(sig, stop_event.set)
+                await stop_event.wait()
+                await ptb_app.updater.stop()
+                await ptb_app.stop()
+
+        asyncio.run(run())
 
 if __name__ == "__main__":
     main()
