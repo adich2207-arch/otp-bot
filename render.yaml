@@ -10,7 +10,7 @@ services:
       - key: ADMIN_ID
         sync: false
       - key: WEBHOOK_URL
-        sync: false          # set to https://<your-app-name>.onrender.com
+        sync: false          # REQUIRED: set to https://<your-app-name>.onrender.com
       - key: SUPPORT_USERNAME
         sync: false          # your support Telegram username without @
       - key: PORT
@@ -19,6 +19,14 @@ services:
         fromDatabase:
           name: tg-market-db
           property: connectionString
+      # ── Sequence continuity (set these when connecting a fresh database) ──
+      # Use the NEXT id after your last one. E.g. if last account id was 47, set 48.
+      - key: STARTING_ACCOUNT_ID
+        sync: false          # e.g. 48
+      - key: STARTING_DEPOSIT_ID
+        sync: false          # e.g. 120
+      - key: STARTING_WITHDRAWAL_ID
+        sync: false          # e.g. 35
 
 databases:
   - name: tg-market-db
