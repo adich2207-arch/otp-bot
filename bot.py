@@ -201,6 +201,7 @@ def phone_to_country(phone: str) -> tuple:
  DEPOSIT_SCREENSHOT) = range(10)
 
 ADMIN_2FA_PASSWORD = 10  # extra state for two-step verification password
+ADMIN_SERVER_SELECT = 11  # extra state: admin picks server after setting price
 
 # ── Payment details (set these in Render env vars) ────────────────────────────
 PAYMENT_UPI    = os.getenv("PAYMENT_UPI", "yourname@upi")
@@ -242,8 +243,10 @@ def init_db():
             id BIGSERIAL PRIMARY KEY, session TEXT, phone TEXT DEFAULT '',
             price NUMERIC(12,2),
             status TEXT DEFAULT 'available', buyer_id BIGINT DEFAULT NULL,
+            server INTEGER DEFAULT 1,
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''")
+        conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS server INTEGER DEFAULT 1")
         conn.execute("""CREATE TABLE IF NOT EXISTS referral_earnings (
             id BIGSERIAL PRIMARY KEY, referrer_id BIGINT, referred_id BIGINT,
             deposit_id BIGINT, commission NUMERIC(12,2),
@@ -921,15 +924,39 @@ async def set_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("❌ Enter a valid positive price.")
         return ADMIN_ADD_PRICE
+    ctx.user_data["add_price"] = price
+    await update.message.reply_text(
+        f"<b>✅ Price set: {fmt(price)}</b>\n\n"
+        f"<b>📡 Now select the server for this account:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔵 Server 1 — Mixed Quality",   callback_data="addacc_server_1")],
+            [InlineKeyboardButton("🟢 Server 2 — Quality Accounts", callback_data="addacc_server_2")],
+        ])
+    )
+    return ADMIN_SERVER_SELECT
+
+async def set_server(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin picks the server after setting price when adding an account via /login_account."""
+    query = update.callback_query
+    await query.answer()
+    server = int(query.data.split("addacc_server_")[1])
+    price  = ctx.user_data.get("add_price", 0)
+
     with get_db() as conn:
         acc_id = conn.execute(
-            "INSERT INTO accounts (session, phone, price) VALUES (%s,%s,%s) RETURNING id",
-            (ctx.user_data["session"], ctx.user_data.get("phone", ""), price)
+            "INSERT INTO accounts (session, phone, price, server) VALUES (%s,%s,%s,%s) RETURNING id",
+            (ctx.user_data["session"], ctx.user_data.get("phone", ""), price, server)
         ).fetchone()["id"]
-    await update.message.reply_text(
-        f"<b>🎉 Account #{acc_id} Added!</b>\n\n<b>💵 Price: {fmt(price)}</b>\n🟢 <b>Now visible in the marketplace.</b>",
+
+    server_label = "🔵 Server 1 (Mixed)" if server == 1 else "🟢 Server 2 (Quality)"
+    await query.edit_message_text(
+        f"<b>🎉 Account #{acc_id} Added!</b>\n\n"
+        f"<b>💵 Price:</b> {fmt(price)}\n"
+        f"<b>📡 Server:</b> {server_label}\n"
+        f"🟢 <b>Now visible in the marketplace.</b>",
         parse_mode="HTML")
-    # Post to trades channel
+
     phone_raw = ctx.user_data.get("phone", "")
     flag, country_name = phone_to_country(phone_raw)
     await send_to_channel(ctx.bot, TRADES_CHANNEL,
@@ -939,7 +966,7 @@ async def set_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🌍 Country {flag} {country_name}\n"
         f"📱 Phone: <code>{mask_phone(phone_raw)}</code>\n"
         f"💵 Price: <b>{fmt(price)}</b>\n"
-        f"📊 Stock: 1\n"
+        f"� Server: {server_label}\n"
         f"📊 Status: 🟢 Available\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 @OtpSellerStore_Bot"
@@ -1196,35 +1223,69 @@ async def _watch_for_otp(bot, user_id: int, session_str: str, phone: str, acc_id
 BUY_PAGE_SIZE = 20  # countries per page (2 columns × 10 rows)
 
 async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show available countries as 2-column grid: 🏳 CC+dial | price$  with pagination."""
+    """Entry — show Server 1 / Server 2 choice."""
     query = update.callback_query
     await query.answer()
 
-    # Support pagination via callback_data="menu_buy" or "buy_page_2" etc.
-    page = 0
-    if query.data.startswith("buy_page_"):
-        try:
-            page = int(query.data.split("buy_page_")[1])
-        except ValueError:
-            page = 0
+    with get_db() as conn:
+        s1 = conn.execute("SELECT COUNT(*) AS c FROM accounts WHERE status='available' AND server=1").fetchone()["c"]
+        s2 = conn.execute("SELECT COUNT(*) AS c FROM accounts WHERE status='available' AND server=2").fetchone()["c"]
+
+    await query.edit_message_text(
+        f"<b>🛒 MARKETPLACE</b>\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+        f"Choose a server to browse accounts:\n\n"
+        f"🔵 <b>Server 1</b> — Mixed Quality  (<b>{s1}</b> available)\n"
+        f"🟢 <b>Server 2</b> — Quality Accounts  (<b>{s2}</b> available)\n\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔵 Server 1 — Mixed  ({s1})",   callback_data="buy_server_1")],
+            [InlineKeyboardButton(f"🟢 Server 2 — Quality  ({s2})", callback_data="buy_server_2")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")],
+        ])
+    )
+
+
+async def buy_server(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show country grid for the chosen server, with pagination."""
+    query = update.callback_query
+    await query.answer()
+
+    # callback_data is either  buy_server_1 / buy_server_2
+    #                       or buy_spage_1_2  (server 1, page 2)
+    data = query.data
+    if data.startswith("buy_spage_"):
+        parts  = data.split("_")   # ['buy','spage','<srv>','<page>']
+        server = int(parts[2])
+        page   = int(parts[3])
+    else:
+        server = int(data.split("buy_server_")[1])
+        page   = 0
 
     with get_db() as conn:
         accounts  = conn.execute(
-            "SELECT id, price, phone FROM accounts WHERE status='available' ORDER BY price ASC"
+            "SELECT id, price, phone FROM accounts WHERE status='available' AND server=%s ORDER BY price ASC",
+            (server,)
         ).fetchall()
         countries = conn.execute(
             "SELECT country_code, country_name, dial_code FROM country_prices ORDER BY LENGTH(dial_code) DESC"
         ).fetchall()
 
+    server_label = "🔵 Server 1 — Mixed Quality" if server == 1 else "🟢 Server 2 — Quality Accounts"
+    back_cb      = "menu_buy"
+
     if not accounts:
         await query.edit_message_text(
-            "<b>🛒 MARKETPLACE</b>\n"
-            "<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
-            "<b>😔 No accounts available right now.</b>\nCheck back soon!",
-            parse_mode="HTML", reply_markup=back_keyboard())
+            f"<b>🛒 {server_label}</b>\n"
+            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+            f"<b>😔 No accounts available right now.</b>\nCheck back soon!",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data=back_cb)]
+            ]))
         return
 
-    # Group accounts by country
     def get_country(phone):
         p = (phone or "").strip().lstrip("+")
         for c in countries:
@@ -1235,7 +1296,7 @@ async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return code, name, dial
         return "XX", "Other", "0"
 
-    country_data = {}  # {country_code: {name, dial, count, min_price}}
+    country_data = {}
     for acc in accounts:
         code, name, dial = get_country(acc["phone"] or "")
         if code not in country_data:
@@ -1243,22 +1304,19 @@ async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         country_data[code]["count"] += 1
         country_data[code]["price"] = min(country_data[code]["price"], float(acc["price"]))
 
-    # Sort alphabetically by country name
     sorted_countries = sorted(country_data.items(), key=lambda x: x[1]["name"])
     total_countries  = len(sorted_countries)
     total_pages      = max(1, (total_countries + BUY_PAGE_SIZE - 1) // BUY_PAGE_SIZE)
     page             = max(0, min(page, total_pages - 1))
+    page_slice       = sorted_countries[page * BUY_PAGE_SIZE : (page + 1) * BUY_PAGE_SIZE]
 
-    page_slice = sorted_countries[page * BUY_PAGE_SIZE : (page + 1) * BUY_PAGE_SIZE]
-
-    # Build 2-column buttons: 🏳 CC+dial | price$
     buttons = []
     row = []
     for code, info in page_slice:
         flag  = country_flag(code)
-        inr   = round(info['price'] * USD_TO_INR)
+        inr   = round(info["price"] * USD_TO_INR)
         label = f"{flag} {code}+{info['dial']} | ₹{inr}"
-        btn   = InlineKeyboardButton(label, callback_data=f"buycountry_{code}")
+        btn   = InlineKeyboardButton(label, callback_data=f"buycountry_{server}_{code}")
         row.append(btn)
         if len(row) == 2:
             buttons.append(row)
@@ -1266,46 +1324,47 @@ async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if row:
         buttons.append(row)
 
-    # Pagination row
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"buy_page_{page - 1}"))
+        nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"buy_spage_{server}_{page - 1}"))
     nav_row.append(InlineKeyboardButton(f"[{page + 1}] of {total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"buy_page_{page + 1}"))
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"buy_spage_{server}_{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
 
-    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
 
-    total_accounts = sum(v["count"] for v in country_data.values())
+    total_accs = sum(v["count"] for v in country_data.values())
     await query.edit_message_text(
-        f"<b>🛒 MARKETPLACE</b>\n"
+        f"<b>🛒 {server_label}</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
         f"✅ Page {page + 1} of {total_pages}\n"
-        f"✅ <b>{total_accounts} account(s)</b> across <b>{total_countries} countries</b>\n\n"
+        f"✅ <b>{total_accs} account(s)</b> across <b>{total_countries} countries</b>\n\n"
         f"Select a country to browse:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def buy_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show individual accounts for a selected country."""
+    """Show individual accounts for a selected country+server."""
     query = update.callback_query
     await query.answer()
-    country_code = query.data.split("buycountry_")[1]
+
+    # callback_data = buycountry_<server>_<country_code>
+    parts        = query.data.split("buycountry_", 1)[1].split("_", 1)
+    server       = int(parts[0])
+    country_code = parts[1]
 
     with get_db() as conn:
-        # Get country info
-        country = conn.execute(
+        country   = conn.execute(
             "SELECT country_name, dial_code FROM country_prices WHERE country_code=%s",
             (country_code,)
         ).fetchone()
-        # Get available accounts for this country by matching dial code
-        all_accs = conn.execute(
-            "SELECT id, price, phone FROM accounts WHERE status='available' ORDER BY price ASC"
+        all_accs  = conn.execute(
+            "SELECT id, price, phone FROM accounts WHERE status='available' AND server=%s ORDER BY price ASC",
+            (server,)
         ).fetchall()
-        # Get all known dial codes for "Other" fallback filtering
         all_dials = conn.execute(
             "SELECT dial_code FROM country_prices ORDER BY LENGTH(dial_code) DESC"
         ).fetchall()
@@ -1314,33 +1373,30 @@ async def buy_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         dial = country["dial_code"]
         name = country["country_name"]
         flag = country_flag(country_code)
-        # Filter accounts matching this country's dial code
         accs = [a for a in all_accs if (a["phone"] or "").strip().lstrip("+").startswith(dial)]
     else:
-        # Check built-in fallback map for this country_code
         builtin_match = next(((d, n) for d, c, n in _BUILTIN_DIAL_MAP if c == country_code), None)
         if builtin_match:
             dial, name = builtin_match
             flag = country_flag(country_code)
             accs = [a for a in all_accs if (a["phone"] or "").strip().lstrip("+").startswith(dial)]
         else:
-            # "XX" / Other — show accounts that don't match ANY known dial code
             dial, name, flag = "0", "Other", "🌍"
             known_dials = [r["dial_code"] for r in all_dials if r["dial_code"]]
             known_dials += [d for d, c, n in _BUILTIN_DIAL_MAP]
             def matches_any(phone):
                 p = (phone or "").strip().lstrip("+")
-                for d in known_dials:
-                    if p.startswith(d):
-                        return True
-                return False
+                return any(p.startswith(d) for d in known_dials)
             accs = [a for a in all_accs if not matches_any(a["phone"])]
+
+    server_label = "🔵 Server 1" if server == 1 else "🟢 Server 2"
+    back_cb      = f"buy_server_{server}"
 
     if not accs:
         await query.edit_message_text(
-            f"😔 No {flag} {name} accounts available right now.",
+            f"😔 No {flag} {name} accounts available on {server_label} right now.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="menu_buy")]
+                [InlineKeyboardButton("🔙 Back", callback_data=back_cb)]
             ]))
         return
 
@@ -1348,14 +1404,13 @@ async def buy_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for a in accs:
         buttons.append([InlineKeyboardButton(
             f"🔑 Account #{a['id']}  —  {fmt(a['price'])}",
-            callback_data=f"view_{a['id']}"
+            callback_data=f"view_{server}_{a['id']}"
         )])
-    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="menu_buy")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
 
     await query.edit_message_text(
-        f"<b>🛒 MARKETPLACE</b>\n"
+        f"<b>🛒 {server_label} — {flag} {name}</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
-        f"{flag} <b>{name}</b> accounts\n"
         f"<b>📦 {len(accs)} available</b>\n\n"
         f"Tap any account to view details:",
         parse_mode="HTML",
@@ -1364,40 +1419,52 @@ async def buy_country(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def view_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    acc_id  = int(query.data.split("_")[1])
+    # callback_data = view_<server>_<acc_id>
+    parts   = query.data.split("_")   # ['view','<srv>','<id>']
+    server  = int(parts[1])
+    acc_id  = int(parts[2])
     user_id = query.from_user.id
     ensure_user(user_id, query.from_user.username or "")
     with get_db() as conn:
-        acc = conn.execute("SELECT id, price FROM accounts WHERE id=%s AND status='available'", (acc_id,)).fetchone()
+        acc = conn.execute(
+            "SELECT id, price FROM accounts WHERE id=%s AND status='available' AND server=%s",
+            (acc_id, server)
+        ).fetchone()
+    server_label = "🔵 Server 1" if server == 1 else "🟢 Server 2"
     if not acc:
         await query.edit_message_text("❌ No longer available.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Browse Others", callback_data="menu_buy")]])); return
-    balance = get_balance(user_id)
+    balance   = get_balance(user_id)
     has_funds = balance >= float(acc["price"])
     await query.edit_message_text(
         f"<b>🔑 ACCOUNT DETAILS</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
         f"<b>🆔 Account ID:  #{acc['id']}</b>\n"
-        f"<b>💵 Price:       {fmt(acc['price'])}</b>\n\n"
+        f"<b>� Server:      {server_label}</b>\n"
+        f"<b>�💵 Price:       {fmt(acc['price'])}</b>\n\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"<b>💼 Your Balance: {fmt(balance)}</b>\n"
         f"{'<b>✅ You have enough funds.</b>' if has_funds else '<b>❌ Insufficient balance — deposit first.</b>'}\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅  Buy Now", callback_data=f"confirm_{acc_id}")],
-            [InlineKeyboardButton("🔙  Back",    callback_data="menu_buy")]]))
+            [InlineKeyboardButton("✅  Buy Now", callback_data=f"confirm_{server}_{acc_id}")],
+            [InlineKeyboardButton("🔙  Back",    callback_data=f"buy_server_{server}")]]))
 
 async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    acc_id  = int(query.data.split("_")[1])
+    # callback_data = confirm_<server>_<acc_id>
+    parts   = query.data.split("_")   # ['confirm','<srv>','<id>']
+    server  = int(parts[1])
+    acc_id  = int(parts[2])
     user_id = query.from_user.id
     ensure_user(user_id, query.from_user.username or "")
 
     with get_db() as conn:
         acc = conn.execute(
-            "SELECT * FROM accounts WHERE id=%s AND status='available'", (acc_id,)
+            "SELECT * FROM accounts WHERE id=%s AND status='available' AND server=%s",
+            (acc_id, server)
         ).fetchone()
         if not acc:
             await query.edit_message_text("❌ Account no longer available."); return
@@ -1416,7 +1483,6 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Deduct balance and mark sold
         conn.execute(
             "UPDATE users SET balance=balance-%s WHERE user_id=%s", (acc["price"], user_id)
         )
@@ -1424,10 +1490,12 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "UPDATE accounts SET status='sold', buyer_id=%s WHERE id=%s", (user_id, acc_id)
         )
 
+    server_label = "🔵 Server 1" if server == 1 else "🟢 Server 2"
     await query.edit_message_text(
         f"<b>🎉 Purchase Successful!</b>\n\n"
         f"<b>🔑 Account #{acc_id} is yours!</b>\n"
-        f"<b>💵 Paid: {fmt(acc['price'])}</b>\n\n"
+        f"<b>� Server: {server_label}</b>\n"
+        f"<b>�💵 Paid: {fmt(acc['price'])}</b>\n\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"⏳ <b>Sending login details...</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
@@ -1437,13 +1505,13 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     phone = acc.get("phone", "").strip()
 
-    # ── Send phone number + password to buyer immediately ────────────────────
     await ctx.bot.send_message(
         user_id,
         f"<b>📱 Your Account Details</b>\n\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"<b>📞 Phone Number:</b> <code>{phone}</code>\n"
         f"<b>🔒 Password:</b> <code>Pass1211</code>\n"
+        f"<b>📡 Server:</b> {server_label}\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"<b>How to login:</b>\n"
         f"<b>1️⃣</b>  Open Telegram on any device\n"
@@ -1455,21 +1523,19 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    # ── Launch OTP watcher as a background task on the shared event loop ─────
     import asyncio
     asyncio.get_event_loop().create_task(
         _watch_for_otp(ctx.bot, user_id, acc["session"], phone, acc_id)
     )
 
-    # Notify admin
     await ctx.bot.send_message(
         ADMIN_ID,
         f"<b>💸 Account Sold</b>\n\n"
         f"<b>🔑 Account #{acc_id}</b> sold to <code>{user_id}</code> for <b>{fmt(acc['price'])}</b>.\n"
-        f"<b>📱 Phone:</b> <code>{phone}</code>",
+        f"<b>📱 Phone:</b> <code>{phone}</code>\n"
+        f"<b>📡 Server:</b> {server_label}",
         parse_mode="HTML"
     )
-    # Post to trades channel — no username, only chat ID + Buy Now button
     flag, country_name = phone_to_country(phone)
     bot_username = (await ctx.bot.get_me()).username
     buy_now_kb = InlineKeyboardMarkup([
@@ -1482,6 +1548,7 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🌍 Country {flag} {country_name}\n"
         f"📱 Phone: <code>{mask_phone(phone)}</code>\n"
         f"💵 Price: <b>{fmt(acc['price'])}</b>\n"
+        f"📡 Server: {server_label}\n"
         f"👤 Buyer: <code>{user_id}</code>\n"
         f"📊 Status: ✅ Sold\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -2559,16 +2626,32 @@ async def ap_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def ap_list_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin panel → All Accounts with per-account Edit Price buttons."""
+    """Admin panel → All Accounts, filterable by server, with Edit Price + Change Server buttons."""
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
         await query.answer("Not authorised.", show_alert=True); return
     await query.answer()
 
+    # callback_data is ap_list_accounts  OR  ap_list_accounts_1 / ap_list_accounts_2
+    data          = query.data
+    server_filter = None
+    if data.startswith("ap_list_accounts_"):
+        try:
+            server_filter = int(data.split("ap_list_accounts_")[1])
+        except ValueError:
+            server_filter = None
+
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id, phone, price, status, buyer_id FROM accounts ORDER BY id DESC LIMIT 30"
-        ).fetchall()
+        if server_filter:
+            rows = conn.execute(
+                "SELECT id, phone, price, status, buyer_id, server FROM accounts "
+                "WHERE server=%s ORDER BY id DESC LIMIT 30",
+                (server_filter,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, phone, price, status, buyer_id, server FROM accounts ORDER BY id DESC LIMIT 30"
+            ).fetchall()
 
     if not rows:
         await query.edit_message_text(
@@ -2576,23 +2659,41 @@ async def ap_list_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]]))
         return
 
-    icons = {"available": "🟢", "sold": "✅", "pending_review": "🔄"}
-    lines = [f"<b>📦 Accounts (latest 30)</b>\n<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>"]
+    icons  = {"available": "🟢", "sold": "✅", "pending_review": "🔄"}
+    slabel = {1: "🔵S1", 2: "🟢S2"}
+    lines  = [f"<b>📦 Accounts (latest 30)</b>\n<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>"]
     buttons = []
+
+    # Server filter row at the top
+    buttons.append([
+        InlineKeyboardButton("📋 All",          callback_data="ap_list_accounts"),
+        InlineKeyboardButton("🔵 Server 1",     callback_data="ap_list_accounts_1"),
+        InlineKeyboardButton("🟢 Server 2",     callback_data="ap_list_accounts_2"),
+    ])
+
     for r in rows:
         flag, _ = phone_to_country(r["phone"] or "")
-        icon = icons.get(r["status"], "⚪")
-        line = (f"{icon} <b>#{r['id']}</b> {flag} <code>{mask_phone(r['phone'] or '')}</code>"
-                f" — <b>{fmt(r['price'])}</b> [{r['status']}]")
+        icon    = icons.get(r["status"], "⚪")
+        srv     = slabel.get(r["server"], f"S{r['server']}")
+        line    = (f"{icon} <b>#{r['id']}</b> [{srv}] {flag} <code>{mask_phone(r['phone'] or '')}</code>"
+                   f" — <b>{fmt(r['price'])}</b> [{r['status']}]")
         if r["buyer_id"]:
             line += f" → <code>{r['buyer_id']}</code>"
         lines.append(line)
-        # Show Edit Price button only for available accounts
+        # Edit Price + Change Server buttons for available accounts
         if r["status"] == "available":
-            buttons.append([InlineKeyboardButton(
-                f"✏️ Edit Price  #{r['id']}  ({fmt(r['price'])})",
-                callback_data=f"acc_editprice_{r['id']}"
-            )])
+            other_srv   = 2 if r["server"] == 1 else 1
+            other_label = "→ S2" if other_srv == 2 else "→ S1"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"✏️ #{r['id']} Price ({fmt(r['price'])})",
+                    callback_data=f"acc_editprice_{r['id']}"
+                ),
+                InlineKeyboardButton(
+                    f"📡 {other_label}",
+                    callback_data=f"acc_chgsrv_{r['id']}_{other_srv}"
+                ),
+            ])
 
     text = "\n".join(lines)
     if len(text) > 3500:
@@ -2603,6 +2704,24 @@ async def ap_list_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+async def acc_chgsrv_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin taps 📡 → S1 / → S2 to move account between servers instantly."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Not authorised.", show_alert=True); return
+    parts  = query.data.split("acc_chgsrv_")[1].split("_")
+    acc_id = int(parts[0])
+    new_srv = int(parts[1])
+    with get_db() as conn:
+        acc = conn.execute("SELECT id, status FROM accounts WHERE id=%s", (acc_id,)).fetchone()
+        if not acc or acc["status"] != "available":
+            await query.answer("Account not found or not available.", show_alert=True); return
+        conn.execute("UPDATE accounts SET server=%s WHERE id=%s", (new_srv, acc_id))
+    label = "🔵 Server 1" if new_srv == 1 else "🟢 Server 2"
+    await query.answer(f"✅ #{acc_id} moved to {label}", show_alert=True)
+    # Refresh the list
+    await ap_list_accounts(update, ctx)
 
 # ── Admin: edit account price ─────────────────────────────────────────────────
 ACC_EDIT_PRICE = 20   # conversation state
@@ -2897,6 +3016,7 @@ def build_app() -> Application:
             ADMIN_OTP:          [MessageHandler(filters.TEXT & ~filters.COMMAND, get_otp)],
             ADMIN_2FA_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_2fa_password)],
             ADMIN_ADD_PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, set_price)],
+            ADMIN_SERVER_SELECT:[CallbackQueryHandler(set_server, pattern=r"^addacc_server_[12]$")],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -2961,7 +3081,6 @@ def build_app() -> Application:
     # ── Admin Panel ──────────────────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(admin_panel,          pattern="^admin_panel$"))
     app.add_handler(CallbackQueryHandler(ap_add_account,       pattern="^ap_add_account$"))
-    app.add_handler(CallbackQueryHandler(ap_list_accounts,     pattern="^ap_list_accounts$"))
     app.add_handler(CallbackQueryHandler(ap_pending_sells,     pattern="^ap_pending_sells$"))
     app.add_handler(CallbackQueryHandler(ap_prices_menu,       pattern="^ap_prices_menu$"))
     app.add_handler(CallbackQueryHandler(ap_pending_deps,      pattern="^ap_pending_deps$"))
@@ -3006,11 +3125,15 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(r"^/reject_\d+$")  & filters.User(ADMIN_ID), admin_reject))
     app.add_handler(MessageHandler(filters.Regex(r"^/del_\d+$")     & filters.User(ADMIN_ID), admin_delete))
     app.add_handler(CallbackQueryHandler(buy_menu,      pattern="^menu_buy$"))
-    app.add_handler(CallbackQueryHandler(buy_menu,      pattern=r"^buy_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(buy_server,    pattern=r"^buy_server_[12]$"))
+    app.add_handler(CallbackQueryHandler(buy_server,    pattern=r"^buy_spage_\d+_\d+$"))
     app.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^noop$"))
-    app.add_handler(CallbackQueryHandler(buy_country,   pattern=r"^buycountry_"))
-    app.add_handler(CallbackQueryHandler(view_account,  pattern=r"^view_\d+$"))
-    app.add_handler(CallbackQueryHandler(confirm_buy,   pattern=r"^confirm_\d+$"))
+    app.add_handler(CallbackQueryHandler(buy_country,   pattern=r"^buycountry_\d+_"))
+    app.add_handler(CallbackQueryHandler(view_account,  pattern=r"^view_\d+_\d+$"))
+    app.add_handler(CallbackQueryHandler(confirm_buy,   pattern=r"^confirm_\d+_\d+$"))
+    app.add_handler(CallbackQueryHandler(acc_chgsrv_cb, pattern=r"^acc_chgsrv_\d+_[12]$"))
+    app.add_handler(CallbackQueryHandler(ap_list_accounts, pattern="^ap_list_accounts$"))
+    app.add_handler(CallbackQueryHandler(ap_list_accounts, pattern=r"^ap_list_accounts_[12]$"))
     app.add_handler(CallbackQueryHandler(show_balance,  pattern="^menu_balance$"))
     app.add_handler(CallbackQueryHandler(refer_menu,    pattern="^menu_refer$"))
     app.add_handler(CallbackQueryHandler(my_orders,     pattern="^menu_orders$"))
@@ -3022,91 +3145,55 @@ def main():
     init_db()
     ptb_app = build_app()
 
-    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+    import asyncio
+    import signal
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    if WEBHOOK_URL:
-        # ── Webhook mode (Render / any public HTTPS host) ─────────────────────
-        import asyncio
-        import signal
+    # ── Health-check server so Render sees an open port ───────────────────────
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass
 
-        async def run():
-            logger.info(f"🚀 Starting bot in webhook mode on port {PORT}...")
-            await ptb_app.initialize()
-            await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-            await ptb_app.start()
-            await ptb_app.updater.start_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=BOT_TOKEN,
-                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-                drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"],
-            )
-            logger.info(f"✅ Webhook active: {WEBHOOK_URL}/{BOT_TOKEN}")
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
+    logger.info(f"✅ Health-check server on port {PORT}")
 
-            stop_event = asyncio.Event()
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    loop.add_signal_handler(sig, stop_event.set)
-                except NotImplementedError:
-                    pass  # Windows doesn't support add_signal_handler
-            await stop_event.wait()
+    async def run():
+        logger.info("🚀 Starting bot in polling mode...")
+        await ptb_app.initialize()
+        await ptb_app.bot.delete_webhook(drop_pending_updates=True)
+        await ptb_app.start()
+        await ptb_app.updater.start_polling(
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+            # These two settings keep the connection alive on Render
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+        )
+        logger.info("✅ Bot is running.")
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass  # Windows
+        await stop_event.wait()
+        logger.info("🛑 Shutting down...")
+        await ptb_app.updater.stop()
+        await ptb_app.stop()
+        await ptb_app.shutdown()
 
-            logger.info("🛑 Shutting down...")
-            await ptb_app.updater.stop()
-            await ptb_app.stop()
-            await ptb_app.shutdown()
-
-        asyncio.run(run())
-
-    else:
-        # ── Polling mode (local development only) ─────────────────────────────
-        import asyncio
-        import signal
-        import threading
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-
-        # Minimal health-check server so a local run still binds the port
-        class HealthHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"OK")
-            def log_message(self, *args):
-                pass
-
-        threading.Thread(
-            target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
-            daemon=True,
-        ).start()
-        logger.info(f"Health check server running on port {PORT}")
-
-        async def run():
-            logger.info("🚀 Starting bot in polling mode (local)...")
-            await ptb_app.initialize()
-            await ptb_app.bot.delete_webhook(drop_pending_updates=True)
-            await ptb_app.start()
-            await ptb_app.updater.start_polling(
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
-            )
-            logger.info("✅ Bot is running. Press Ctrl+C to stop.")
-            stop_event = asyncio.Event()
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    loop.add_signal_handler(sig, stop_event.set)
-                except NotImplementedError:
-                    pass
-            await stop_event.wait()
-
-            logger.info("🛑 Shutting down...")
-            await ptb_app.updater.stop()
-            await ptb_app.stop()
-            await ptb_app.shutdown()
-
-        asyncio.run(run())
+    asyncio.run(run())
 
 if __name__ == "__main__":
     main()
