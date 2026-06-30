@@ -355,14 +355,46 @@ def back_keyboard():
 
 # ── PTB error handler (logs ALL handler exceptions to console) ────────────────
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling update:", exc_info=ctx.error)
-    logger.error(traceback.format_exc())
-    # Try to notify the user something went wrong
+    """Global error handler — logs real errors, silently ignores Telegram non-issues."""
+    import telegram.error as tg_err
+
+    err = ctx.error
+
+    # ── Silently ignore errors that are NOT real failures ─────────────────────
+    # These happen routinely (e.g. user clicks a button on an old message, double-tap, etc.)
+    ignored = (
+        tg_err.BadRequest,        # "Message is not modified", "Query is too old", etc.
+        tg_err.MessageNotModified,
+    )
+    if isinstance(err, ignored):
+        msg = str(err).lower()
+        # Only truly ignore the benign ones; let real bad requests bubble up
+        benign = (
+            "message is not modified",
+            "query is too old",
+            "message to edit not found",
+            "message can't be edited",
+            "there is no text in the message",
+        )
+        if any(b in msg for b in benign):
+            return  # completely silent — no user message
+
+    logger.error("Exception while handling update:", exc_info=err)
+
+    # ── For real errors, notify the user once via answer() or reply ───────────
     try:
-        if isinstance(update, Update) and update.effective_message:
-            await update.effective_message.reply_text(
-                "⚠️ Something went wrong. Please try again or contact support."
-            )
+        if isinstance(update, Update):
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(
+                        "⚠️ Something went wrong. Please try again.", show_alert=False
+                    )
+                except Exception:
+                    pass
+            elif update.effective_message:
+                await update.effective_message.reply_text(
+                    "⚠️ Something went wrong. Please try again or contact support."
+                )
     except Exception:
         pass
 
@@ -1223,25 +1255,18 @@ async def _watch_for_otp(bot, user_id: int, session_str: str, phone: str, acc_id
 BUY_PAGE_SIZE = 20  # countries per page (2 columns × 10 rows)
 
 async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry — show Server 1 / Server 2 choice."""
+    """Entry — show Server 1 / Server 2 choice with clean names only."""
     query = update.callback_query
     await query.answer()
-
-    with get_db() as conn:
-        s1 = conn.execute("SELECT COUNT(*) AS c FROM accounts WHERE status='available' AND server=1").fetchone()["c"]
-        s2 = conn.execute("SELECT COUNT(*) AS c FROM accounts WHERE status='available' AND server=2").fetchone()["c"]
 
     await query.edit_message_text(
         f"<b>🛒 MARKETPLACE</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
-        f"Choose a server to browse accounts:\n\n"
-        f"🔵 <b>Server 1</b> — Mixed Quality  (<b>{s1}</b> available)\n"
-        f"🟢 <b>Server 2</b> — Quality Accounts  (<b>{s2}</b> available)\n\n"
-        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
+        f"Select a server to browse available accounts:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🔵 Server 1 — Mixed  ({s1})",   callback_data="buy_server_1")],
-            [InlineKeyboardButton(f"🟢 Server 2 — Quality  ({s2})", callback_data="buy_server_2")],
+            [InlineKeyboardButton("🔵  Server 1", callback_data="buy_server_1"),
+             InlineKeyboardButton("🟢  Server 2", callback_data="buy_server_2")],
             [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")],
         ])
     )
@@ -1494,8 +1519,8 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"<b>🎉 Purchase Successful!</b>\n\n"
         f"<b>🔑 Account #{acc_id} is yours!</b>\n"
-        f"<b>� Server: {server_label}</b>\n"
-        f"<b>�💵 Paid: {fmt(acc['price'])}</b>\n\n"
+        f"<b>📡 Server: {server_label}</b>\n"
+        f"<b>💵 Paid: {fmt(acc['price'])}</b>\n\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"⏳ <b>Sending login details...</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
@@ -1505,29 +1530,28 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     phone = acc.get("phone", "").strip()
 
+    # ── Send phone + password with on-demand OTP button ──────────────────────
     await ctx.bot.send_message(
         user_id,
         f"<b>📱 Your Account Details</b>\n\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
         f"<b>📞 Phone Number:</b> <code>{phone}</code>\n"
-        f"<b>🔒 Password:</b> <code>Pass1211</code>\n"
+        f"<b>🔒 2FA Password:</b> <code>Pass1211</code>\n"
         f"<b>📡 Server:</b> {server_label}\n"
-        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
         f"<b>How to login:</b>\n"
         f"<b>1️⃣</b>  Open Telegram on any device\n"
         f"<b>2️⃣</b>  Enter the phone number above\n"
-        f"<b>3️⃣</b>  Telegram will send an OTP to this account\n"
-        f"<b>4️⃣</b>  I will automatically forward the OTP to you here ⬇️\n"
-        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-        f"⏳ <b>Waiting for OTP... (up to 5 minutes)</b>",
-        parse_mode="HTML"
+        f"<b>3️⃣</b>  Telegram sends an OTP to <b>this</b> account\n"
+        f"<b>4️⃣</b>  Press <b>🔐 Get Telegram Code</b> below to fetch it\n\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔐 Get Telegram Code", callback_data=f"getotp_{acc_id}")],
+        ])
     )
 
-    import asyncio
-    asyncio.get_event_loop().create_task(
-        _watch_for_otp(ctx.bot, user_id, acc["session"], phone, acc_id)
-    )
-
+    # Notify admin
     await ctx.bot.send_message(
         ADMIN_ID,
         f"<b>💸 Account Sold</b>\n\n"
@@ -1557,8 +1581,113 @@ async def confirm_buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── PRICES ────────────────────────────────────────────────────────────────────
-# Country flag emoji helper (converts country code to flag emoji)
+# ── On-demand OTP fetcher ─────────────────────────────────────────────────────
+async def getotp_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    User taps 🔐 Get Telegram Code or 🔄 Refresh Code.
+    Connects to the sold account's session, reads the LATEST message from
+    Telegram service (777000), extracts and returns the OTP immediately.
+    No background polling — fast on-demand fetch every time.
+    """
+    import re
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    from telethon.tl.functions.messages import GetHistoryRequest
+
+    query   = update.callback_query
+    user_id = query.from_user.id
+    await query.answer("⏳ Fetching code...")
+
+    acc_id = int(query.data.split("getotp_")[1])
+
+    # Verify this account was bought by this user
+    with get_db() as conn:
+        acc = conn.execute(
+            "SELECT session, phone FROM accounts WHERE id=%s AND buyer_id=%s",
+            (acc_id, user_id)
+        ).fetchone()
+
+    if not acc:
+        await query.answer("❌ Account not found or not yours.", show_alert=True)
+        return
+
+    phone       = acc["phone"] or ""
+    session_str = acc["session"]
+
+    # Show loading state on the button while fetching
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏳ Fetching code...", callback_data="noop")],
+            ])
+        )
+    except Exception:
+        pass
+
+    otp_code = None
+    try:
+        client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        await client.connect()
+        try:
+            service_peer = await client.get_input_entity(777000)
+            history = await client(GetHistoryRequest(
+                peer=service_peer,
+                limit=5,
+                offset_date=None, offset_id=0,
+                max_id=0, min_id=0, add_offset=0, hash=0
+            ))
+            for msg in history.messages:
+                text = getattr(msg, "message", "") or ""
+                match = re.search(r'\b(\d{5,6})\b', text)
+                if match:
+                    otp_code = match.group(1)
+                    break
+        finally:
+            await client.disconnect()
+    except Exception as e:
+        logger.error(f"[getotp #{acc_id}] error: {e}")
+
+    if otp_code:
+        try:
+            await query.edit_message_text(
+                f"<b>📱 Your Account Details</b>\n\n"
+                f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+                f"<b>📞 Phone:</b> <code>{phone}</code>\n"
+                f"<b>🔒 2FA Password:</b> <code>Pass1211</code>\n"
+                f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+                f"<b>🔑 Telegram Code:</b>  <code>{otp_code}</code>\n"
+                f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+                f"⚠️ Enter this code in Telegram now.\n"
+                f"⚠️ OTP expires in a few minutes.\n\n"
+                f"🔄 Need a newer code? Tap <b>Refresh</b>.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh Code", callback_data=f"getotp_{acc_id}")],
+                ])
+            )
+        except Exception:
+            pass
+    else:
+        # No code found yet — restore button so user can retry
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔐 Get Telegram Code", callback_data=f"getotp_{acc_id}")],
+                ])
+            )
+        except Exception:
+            pass
+        await ctx.bot.send_message(
+            user_id,
+            f"<b>❌ No Telegram code found yet.</b>\n\n"
+            f"Make sure you entered <code>{phone}</code> in Telegram first,\n"
+            f"then tap <b>🔐 Get Telegram Code</b> again.\n\n"
+            f"If Telegram sent the code via SMS instead, check your messages directly.",
+            parse_mode="HTML"
+        )
+
+
+
 def country_flag(code: str) -> str:
     try:
         return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in code.upper()[:2])
@@ -3131,6 +3260,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(buy_country,   pattern=r"^buycountry_\d+_"))
     app.add_handler(CallbackQueryHandler(view_account,  pattern=r"^view_\d+_\d+$"))
     app.add_handler(CallbackQueryHandler(confirm_buy,   pattern=r"^confirm_\d+_\d+$"))
+    app.add_handler(CallbackQueryHandler(getotp_cb,     pattern=r"^getotp_\d+$"))
     app.add_handler(CallbackQueryHandler(acc_chgsrv_cb, pattern=r"^acc_chgsrv_\d+_[12]$"))
     app.add_handler(CallbackQueryHandler(ap_list_accounts, pattern="^ap_list_accounts$"))
     app.add_handler(CallbackQueryHandler(ap_list_accounts, pattern=r"^ap_list_accounts_[12]$"))
