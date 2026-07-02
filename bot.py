@@ -228,8 +228,34 @@ APANEL_EDIT_WAITING = 501
 
 # ── Payment details (set these in Render env vars) ────────────────────────────
 PAYMENT_UPI    = os.getenv("PAYMENT_UPI", "yourname@upi")
-PAYMENT_QR     = os.getenv("PAYMENT_QR_FILE_ID", "")   # Telegram file_id (optional)
-PAYMENT_QR_PATH = os.getenv("PAYMENT_QR_PATH", "qr.png")  # local image file path
+PAYMENT_QR     = os.getenv("PAYMENT_QR_FILE_ID", "")
+PAYMENT_QR_PATH = os.getenv("PAYMENT_QR_PATH", "qr.png")
+
+# ── Crypto Wallet Addresses ───────────────────────────────────────────────────
+# Set these in Render env vars. Leave blank to hide that coin from the menu.
+CRYPTO_USDT_TRC20 = os.getenv("CRYPTO_USDT_TRC20", "")   # USDT TRC20 wallet
+CRYPTO_USDT_BEP20 = os.getenv("CRYPTO_USDT_BEP20", "")   # USDT BEP20 wallet
+CRYPTO_BTC        = os.getenv("CRYPTO_BTC", "")           # Bitcoin wallet
+CRYPTO_LTC        = os.getenv("CRYPTO_LTC", "")           # Litecoin wallet
+
+# Live crypto rates (INR per 1 unit) — fallback static rates, update via env vars
+RATE_USDT_INR = float(os.getenv("RATE_USDT_INR", "95.42"))   # 1 USDT = ₹95.42
+RATE_BTC_INR  = float(os.getenv("RATE_BTC_INR",  "7000000")) # 1 BTC  = ₹70,00,000
+RATE_LTC_INR  = float(os.getenv("RATE_LTC_INR",  "8000"))    # 1 LTC  = ₹8,000
+
+# Map: callback_data key → (display name, network label, wallet_address, rate, decimals)
+def _crypto_coins() -> dict:
+    """Return only coins that have a wallet address configured."""
+    coins = {}
+    if CRYPTO_USDT_TRC20:
+        coins["usdt_trc20"] = ("💵 USDT (TRC20)", "TRC20", CRYPTO_USDT_TRC20, RATE_USDT_INR, 2)
+    if CRYPTO_USDT_BEP20:
+        coins["usdt_bep20"] = ("💵 USDT (BEP20)", "BEP20", CRYPTO_USDT_BEP20, RATE_USDT_INR, 2)
+    if CRYPTO_BTC:
+        coins["btc"]        = ("₿ Bitcoin",        "BTC",   CRYPTO_BTC,        RATE_BTC_INR,  8)
+    if CRYPTO_LTC:
+        coins["ltc"]        = ("Ł Litecoin",        "LTC",   CRYPTO_LTC,        RATE_LTC_INR,  6)
+    return coins
 
 # ── UPI Auto-Verification via Gmail IMAP ─────────────────────────────────────
 # Set GMAIL_USER and GMAIL_APP_PASSWORD in your .env / Render env vars.
@@ -706,15 +732,55 @@ def poll_gmail_for_utr(utr: str, expected_amount_inr: float,
 
 # ── DEPOSIT (DB-backed state — no ConversationHandler) ────────────────────────
 async def deposit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry — clear old session, set step=amount, ask for INR amount."""
+    """Entry — show payment method selection: UPI or Crypto."""
     query = update.callback_query
     await query.answer()
     user = query.from_user
     ensure_user(user.id, user.username or "")
     dep_clear(user.id)
-    dep_set(user.id, step="amount")
+
+    coins = _crypto_coins()
+    kb = [
+        [InlineKeyboardButton("⚡  Pay via UPI Auto",  callback_data="dep_method_upi")],
+    ]
+    if coins:
+        kb.append([InlineKeyboardButton("🪙  Pay via Crypto",   callback_data="dep_method_crypto")])
+    kb.append([InlineKeyboardButton("🔙  Back to Menu", callback_data="menu_back")])
+
     await query.edit_message_text(
         f"<b>💵 RECHARGE WALLET</b>\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+        f"Choose your payment method:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def deposit_method_upi_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User chose UPI — ask for amount."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    dep_clear(user.id)
+    dep_set(user.id, step="amount")
+    await query.edit_message_text(
+        f"<b>💵 RECHARGE — UPI Auto</b>\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+        f"Enter the amount in <b>₹ INR</b> you want to deposit.\n\n"
+        f"📌 <b>Example:</b> <code>500</code>\n\n"
+        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+        f"✏️ <b>Type the amount below</b> or /cancel to go back:",
+        parse_mode="HTML")
+
+
+async def deposit_method_crypto_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User chose Crypto — ask for amount."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    dep_clear(user.id)
+    dep_set(user.id, step="crypto_amount")
+    await query.edit_message_text(
+        f"<b>🪙 RECHARGE — Crypto</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
         f"Enter the amount in <b>₹ INR</b> you want to deposit.\n\n"
         f"📌 <b>Example:</b> <code>500</code>\n\n"
@@ -795,6 +861,89 @@ async def deposit_cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 
+async def dep_coin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped a coin button — show payment address with I've Paid button."""
+    query = update.callback_query
+    await query.answer()
+    user  = query.from_user
+    sess  = dep_get(user.id)
+    if not sess or sess["step"] != "crypto_coin":
+        await query.answer("Session expired. Please start again.", show_alert=True)
+        dep_clear(user.id)
+        return
+
+    coin_key   = query.data.split("dep_coin_")[1]
+    coins      = _crypto_coins()
+    if coin_key not in coins:
+        await query.answer("Unknown coin.", show_alert=True)
+        return
+
+    label, network, address, rate, decimals = coins[coin_key]
+    amount_inr  = float(sess["amount_inr"])
+    amount_usd  = float(sess["amount_usd"])
+    crypto_amt  = round(amount_inr / rate, decimals)
+
+    import time as _t
+    order_id = f"MC_{int(_t.time())}_{user.id}"
+
+    # Save coin choice in session so "I've Paid" knows which coin was used
+    dep_set(user.id, "crypto_proof", amount_usd, amount_inr, utr=f"{coin_key}|{order_id}")
+
+    msg = (
+        f"🌙 <b>CRYPTO PAYMENT</b>\n\n"
+        f"┌── 💎 {label.upper()} PAYMENT ──┐\n"
+        f"│\n"
+        f"│  💰 <b>Amount (INR):</b> ₹{amount_inr:.0f}\n"
+        f"│  🌙 <b>Amount ({network}):</b> <code>{crypto_amt}</code> {network.split('(')[0].strip()[:4]}\n"
+        f"│  📊 <b>Rate:</b> 1 {network.split('(')[0].strip()[:4]} = ₹{rate:,.2f}\n"
+        f"│  🌐 <b>Network:</b> {network}\n"
+        f"│  🪪 <b>Order ID:</b> <code>{order_id}</code>\n"
+        f"│\n"
+        f"└──────────────────────┘\n\n"
+        f"┌── 🔀 SEND TO ADDRESS ──┐\n"
+        f"│  <code>{address}</code>\n"
+        f"└──────────────────────┘\n\n"
+        f"⚡ <b>STEPS:</b>\n"
+        f"↪ Send exactly <b>{crypto_amt} {network.split('(')[0].strip()[:4]}</b> on <b>{network}</b>\n"
+        f"│ Double-check the wallet address before sending\n"
+        f"└ Tap <b>'I've Paid'</b> button after your transaction"
+    )
+    await query.edit_message_text(
+        msg, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅  I've Paid", callback_data="dep_crypto_paid")],
+            [InlineKeyboardButton("⬅️  Back",     callback_data="dep_method_crypto")],
+        ]))
+
+
+async def dep_crypto_paid_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped I've Paid — ask for TXID (transaction hash)."""
+    query = update.callback_query
+    await query.answer()
+    user  = query.from_user
+    sess  = dep_get(user.id)
+    if not sess or sess["step"] != "crypto_proof":
+        await query.answer("Session expired. Please start again.", show_alert=True)
+        dep_clear(user.id)
+        return
+
+    # Advance to txid step — keep amount/coin info in session
+    dep_set(user.id, "crypto_txid",
+            float(sess["amount_usd"]), float(sess["amount_inr"]),
+            utr=sess["utr"])
+
+    await query.edit_message_text(
+        f"<b>✏️ Submit Transaction Hash (TXID)</b>\n\n"
+        f"Paste the transaction hash from your wallet or blockchain explorer.\n\n"
+        f"<i>Example: 0x1a2b3c4d5e6f... or TxID from TronScan</i>\n\n"
+        f"<i>(Send /cancel to abort)</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌  Cancel", callback_data="dep_cancel")]
+        ])
+    )
+
+
 async def deposit_message_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Top-level handler — routes ALL text and photo messages for deposit sessions.
@@ -812,7 +961,7 @@ async def deposit_message_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
                 f"has_text={bool(update.message.text)} "
                 f"has_photo={bool(update.message.photo)}")
 
-    # ── AMOUNT: user types how much they want to pay ──────────────────────────
+    # ── AMOUNT: user types how much they want to pay (UPI path) ─────────────
     if step == "amount":
         if not update.message.text:
             return
@@ -852,6 +1001,138 @@ async def deposit_message_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
                                                  parse_mode="HTML", reply_markup=kb)
         else:
             await update.message.reply_text(caption, parse_mode="HTML", reply_markup=kb)
+
+    # ── CRYPTO_AMOUNT: user types amount, show coin selection ────────────────
+    elif step == "crypto_amount":
+        if not update.message.text:
+            return
+        try:
+            amount_inr = float(update.message.text.strip())
+            if amount_inr <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "<b>❌ Invalid amount.</b> Enter a positive number in ₹ like <code>500</code>.",
+                parse_mode="HTML")
+            return
+        amount_usd = round(amount_inr / USD_TO_INR, 2)
+        dep_set(user.id, "crypto_coin", amount_usd, amount_inr)
+
+        coins = _crypto_coins()
+        coin_buttons = []
+        for key, (label, network, addr, rate, dec) in coins.items():
+            coin_buttons.append([InlineKeyboardButton(label, callback_data=f"dep_coin_{key}")])
+        coin_buttons.append([InlineKeyboardButton("⬅️  Back", callback_data="dep_method_crypto")])
+
+        await update.message.reply_text(
+            f"<b>💰 Select Cryptocurrency</b>\n\n"
+            f"• <b>Amount:</b> ₹{amount_inr:.0f}\n"
+            f"Choose which crypto to pay with:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(coin_buttons))
+
+    # ── CRYPTO_TXID: user pastes their transaction hash ───────────────────────
+    elif step == "crypto_txid":
+        if not update.message.text:
+            await update.message.reply_text(
+                "<b>❌ Please send your TXID as text.</b>\n"
+                "<i>Example: 0x1a2b3c4d5e6f... or TxID from TronScan</i>",
+                parse_mode="HTML")
+            return
+
+        raw_txid = update.message.text.strip()
+        # Basic validation: at least 10 chars, hex or alphanumeric
+        if not re.match(r"^[A-Za-z0-9]{10,100}$", raw_txid.replace("0x","").replace("x","")):
+            await update.message.reply_text(
+                "<b>❌ Invalid TXID format. Please send a valid transaction hash.</b>",
+                parse_mode="HTML")
+            return
+
+        amount_inr = float(sess["amount_inr"])
+        # Store txid in utr field appended after coin|order_id: coin|order_id|txid
+        utr_parts  = (sess["utr"] or "").split("|")
+        coin_key   = utr_parts[0] if utr_parts else ""
+        order_id   = utr_parts[1] if len(utr_parts) > 1 else ""
+        new_utr    = f"{coin_key}|{order_id}|{raw_txid}"
+        dep_set(user.id, "crypto_screenshot",
+                float(sess["amount_usd"]), amount_inr, utr=new_utr)
+
+        await update.message.reply_text(
+            f"<b>📸 Send Payment Screenshot</b>\n\n"
+            f"• <b>TXID:</b> <code>{raw_txid[:20]}...</code>\n"
+            f"• <b>Amount:</b> ₹{amount_inr:.0f}\n\n"
+            f"Now send a <b>screenshot</b> of your transaction from wallet/blockchain explorer.\n\n"
+            f"<i>(Send /cancel to skip screenshot)</i>",
+            parse_mode="HTML")
+
+    # ── CRYPTO_SCREENSHOT: user sends screenshot, finalize and submit ─────────
+    elif step == "crypto_screenshot":
+        amount_usd = float(sess["amount_usd"])
+        amount_inr = float(sess["amount_inr"])
+        utr_parts  = (sess["utr"] or "").split("|")
+        coin_key   = utr_parts[0] if utr_parts else ""
+        order_id   = utr_parts[1] if len(utr_parts) > 1 else ""
+        txid       = utr_parts[2] if len(utr_parts) > 2 else ""
+
+        # Accept photo or /cancel (handled by command handler) — if text, treat as skip
+        photo_id = None
+        if update.message.photo:
+            photo_id = update.message.photo[-1].file_id
+        elif not update.message.text:
+            return
+
+        dep_clear(user.id)
+
+        with get_db() as conn:
+            dep_id = conn.execute(
+                "INSERT INTO deposits (user_id, amount) VALUES (%s,%s) RETURNING id",
+                (user.id, amount_usd)).fetchone()["id"]
+
+        coins    = _crypto_coins()
+        coin_lbl = coins[coin_key][0] if coin_key in coins else coin_key
+
+        # Send "Payment Submitted" confirmation to user
+        await update.message.reply_text(
+            f"<b>✅ Payment Submitted</b>\n\n"
+            f"• <b>TXID:</b> <code>{txid[:20]}...</code>\n"
+            f"• <b>Amount:</b> ₹{amount_inr:.0f}\n"
+            f"• <b>Order:</b> <code>{order_id}</code>\n"
+            f"📸 Screenshot {'received.' if photo_id else 'not provided.'}\n"
+            f"⏳ Admin verification pending. You will be notified upon approval.\n"
+            f"⏰ <b>Maximum review time: 3 hours.</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard(user.id))
+
+        # Admin notification with photo (if provided)
+        admin_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Approve", callback_data=f"dep_approve_{dep_id}"),
+             InlineKeyboardButton("❌ Reject",  callback_data=f"dep_reject_{dep_id}")]
+        ])
+        admin_caption = (
+            f"<b>🪙 CRYPTO DEPOSIT #{dep_id}</b>\n"
+            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+            f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
+            f"<b>💰 Amount:</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
+            f"<b>🪙 Coin:</b> {coin_lbl}\n"
+            f"<b>🔑 TXID:</b> <code>{txid}</code>\n"
+            f"<b>🆔 Order:</b> <code>{order_id}</code>\n"
+            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
+            f"Verify on-chain then approve."
+        )
+        if photo_id:
+            await ctx.bot.send_photo(ADMIN_ID, photo=photo_id,
+                                     caption=admin_caption, parse_mode="HTML",
+                                     reply_markup=admin_kb)
+        else:
+            await ctx.bot.send_message(ADMIN_ID, admin_caption, parse_mode="HTML",
+                                       reply_markup=admin_kb)
+
+        await send_to_channel(ctx.bot, TRADES_CHANNEL,
+            f"╔══════════════════════╗\n║  🪙  CRYPTO DEPOSIT     ║\n╚══════════════════════╝\n\n"
+            f"🆔 <code>#{dep_id}</code>  👤 <code>{user.id}</code>\n"
+            f"💰 <b>₹{amount_inr:.0f}</b>  🪙 {coin_lbl}\n"
+            f"🔑 TXID: <code>{txid[:20]}...</code>\n"
+            f"📊 ⏳ <i>Awaiting Admin Verification</i>")
 
     # ── UTR: user types the UTR or TXN ID ────────────────────────────────────
     elif step == "utr":
@@ -1098,11 +1379,36 @@ async def dep_reject_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(rejected_text, parse_mode="HTML")
     except Exception:
         pass
-    await ctx.bot.send_message(dep["user_id"],
-        f"<b>❌ Deposit Rejected</b>\n\n"
-        f"Your deposit of <b>{fmt(dep['amount'])}</b> (ID: <code>{dep_id}</code>) was not approved.\n"
-        f"Contact <b>🆘 Support</b> if this is an error.",
-        parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+    amount_inr = round(float(dep["amount"]) * USD_TO_INR)
+    # Detect if this was a crypto deposit by checking admin message caption for "TXID"
+    is_crypto = False
+    try:
+        msg_text = query.message.caption or query.message.text or ""
+        is_crypto = "TXID" in msg_text or "CRYPTO" in msg_text
+    except Exception:
+        pass
+
+    if is_crypto:
+        user_msg = (
+            f"<b>❌ CRYPTO REJECTED</b>\n\n"
+            f"┌── ❌ PAYMENT REJECTED ──┐\n"
+            f"│\n"
+            f"│  💰 <b>Amount:</b> ₹{amount_inr}\n"
+            f"│  📝 <b>Reason:</b> TXID not verified\n"
+            f"│\n"
+            f"└──────────────────────┘\n\n"
+            f"💡 <i>Contact support if you believe this is an error.</i>"
+        )
+    else:
+        user_msg = (
+            f"<b>❌ Deposit Rejected</b>\n\n"
+            f"Your deposit of <b>{fmt(dep['amount'])}</b> (ID: <code>{dep_id}</code>) was not approved.\n"
+            f"Contact <b>🆘 Support</b> if this is an error."
+        )
+
+    await ctx.bot.send_message(dep["user_id"], user_msg, parse_mode="HTML",
+                               reply_markup=main_menu_keyboard())
     await send_to_channel(ctx.bot, TRADES_CHANNEL,
         f"❌ <b>DEPOSIT REJECTED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3521,19 +3827,19 @@ async def ap_broadcast_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     # ── Deposit: DB-backed state router (no ConversationHandler) ─────────────
-    # Entry point — user taps 💵 Recharge
-    app.add_handler(CallbackQueryHandler(deposit_start,      pattern="^menu_deposit$"))
-    # Inline buttons on the QR payment message
-    app.add_handler(CallbackQueryHandler(deposit_ipaid_cb,   pattern="^dep_ipaid$"))
-    app.add_handler(CallbackQueryHandler(deposit_qrnw_cb,    pattern="^dep_qrnw$"))
-    app.add_handler(CallbackQueryHandler(deposit_cancel_cb,  pattern="^dep_cancel$"))
-    # /cancel command clears deposit session
+    app.add_handler(CallbackQueryHandler(deposit_start,            pattern="^menu_deposit$"))
+    app.add_handler(CallbackQueryHandler(deposit_method_upi_cb,   pattern="^dep_method_upi$"))
+    app.add_handler(CallbackQueryHandler(deposit_method_crypto_cb, pattern="^dep_method_crypto$"))
+    app.add_handler(CallbackQueryHandler(dep_coin_cb,              pattern=r"^dep_coin_\w+$"))
+    app.add_handler(CallbackQueryHandler(dep_crypto_paid_cb,       pattern="^dep_crypto_paid$"))
+    app.add_handler(CallbackQueryHandler(deposit_ipaid_cb,         pattern="^dep_ipaid$"))
+    app.add_handler(CallbackQueryHandler(deposit_qrnw_cb,          pattern="^dep_qrnw$"))
+    app.add_handler(CallbackQueryHandler(deposit_cancel_cb,        pattern="^dep_cancel$"))
     app.add_handler(CommandHandler("cancel", deposit_cancel_cmd))
-    # Single router handles all text + photo messages during a deposit session
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
         deposit_message_router,
-        block=False,   # non-blocking so Gmail IMAP check doesn't freeze other updates
+        block=False,
     ))
     # ─────────────────────────────────────────────────────────────────────────
     withdraw_conv = ConversationHandler(
