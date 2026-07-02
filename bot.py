@@ -201,14 +201,30 @@ def phone_to_country(phone: str) -> tuple:
         pass
     return "🌍", "Unknown"
 
-(DEPOSIT_AMOUNT, ADMIN_PHONE, ADMIN_OTP, ADMIN_ADD_PRICE,
- SELL_PHONE, SELL_OTP, SELL_PRICE, WITHDRAW_UPI, WITHDRAW_AMOUNT,
- DEPOSIT_SCREENSHOT) = range(10)
+# ── Conversation state integers ───────────────────────────────────────────────
+# Each ConversationHandler uses its own namespace via name= parameter.
+# Keep all state ints distinct to avoid cross-handler interference.
+DEPOSIT_AMOUNT    = 100
+DEPOSIT_UTR       = 101
+DEPOSIT_PROOF     = 102
+DEPOSIT_SCREENSHOT= 103
 
-ADMIN_2FA_PASSWORD  = 10  # extra state for two-step verification password
-ADMIN_SERVER_SELECT = 11  # extra state: admin picks server after setting price
-DEPOSIT_UTR         = 12  # extra state: user enters UTR
-DEPOSIT_PROOF       = 13  # extra state: user sends screenshot after UTR
+ADMIN_PHONE       = 200
+ADMIN_OTP         = 201
+ADMIN_ADD_PRICE   = 202
+ADMIN_2FA_PASSWORD= 203
+ADMIN_SERVER_SELECT=204
+
+SELL_PHONE        = 300
+SELL_OTP          = 301
+SELL_PRICE        = 302
+SELL_APPROVE_PRICE_STATE = 303
+
+WITHDRAW_UPI      = 400
+WITHDRAW_AMOUNT   = 401
+
+APANEL_ADD_WAITING  = 500
+APANEL_EDIT_WAITING = 501
 
 # ── Payment details (set these in Render env vars) ────────────────────────────
 PAYMENT_UPI    = os.getenv("PAYMENT_UPI", "yourname@upi")
@@ -2106,8 +2122,8 @@ async def cmd_prices(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ── ADMIN PRICE PANEL ─────────────────────────────────────────────────────────
-(APANEL_ADD_WAITING, APANEL_EDIT_WAITING, APANEL_DEL_CONFIRM) = range(10, 13)
-SELL_APPROVE_PRICE = 13  # state: admin enters price after approving a sell submission
+APANEL_DEL_CONFIRM  = 502
+SELL_APPROVE_PRICE  = 303  # alias — same value as SELL_APPROVE_PRICE_STATE
 
 def _prices_panel_keyboard(rows):
     """Build the admin price panel keyboard."""
@@ -3538,6 +3554,7 @@ async def ap_broadcast_prompt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     deposit_conv = ConversationHandler(
+        name="deposit",
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^menu_deposit$")],
         states={
             DEPOSIT_AMOUNT: [
@@ -3546,12 +3563,16 @@ def build_app() -> Application:
                 CallbackQueryHandler(deposit_qrnw_cb,   pattern="^dep_qrnw$"),
                 CallbackQueryHandler(deposit_cancel_cb, pattern="^dep_cancel$"),
             ],
-            DEPOSIT_UTR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_utr)],
-            DEPOSIT_PROOF:  [MessageHandler(filters.PHOTO, deposit_proof)],
+            DEPOSIT_UTR:        [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_utr)],
+            DEPOSIT_PROOF:      [MessageHandler(filters.PHOTO, deposit_proof)],
             DEPOSIT_SCREENSHOT: [MessageHandler(filters.PHOTO, deposit_screenshot)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=False)
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+        allow_reentry=True,
+    )
     withdraw_conv = ConversationHandler(
+        name="withdraw",
         entry_points=[CallbackQueryHandler(withdraw_menu, pattern="^menu_withdraw$")],
         states={
             WITHDRAW_UPI: [
@@ -3560,8 +3581,11 @@ def build_app() -> Application:
             ],
             WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)], per_message=False)
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+    )
     login_conv = ConversationHandler(
+        name="login",
         entry_points=[CommandHandler("login_account", admin_login)],
         states={
             ADMIN_PHONE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
@@ -3578,20 +3602,20 @@ def build_app() -> Application:
         allow_reentry=True,
     )
     sell_conv = ConversationHandler(
+        name="sell",
         entry_points=[CallbackQueryHandler(sell_menu, pattern="^menu_sell$")],
         states={
-            SELL_PHONE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, sell_get_phone),
-            ],
-            SELL_OTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_get_otp)],
+            SELL_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_get_phone)],
+            SELL_OTP:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_get_otp)],
         },
         fallbacks=[
             CommandHandler("cancel", sell_cancel),
             CallbackQueryHandler(menu_back, pattern="^menu_back$"),
         ],
-        per_message=False)
-    # Admin price panel conversation
+        per_message=False,
+    )
     apanel_conv = ConversationHandler(
+        name="apanel",
         entry_points=[
             CommandHandler("adminprices", admin_prices_panel),
             CallbackQueryHandler(ap_add,  pattern="^ap_add$"),
@@ -3604,8 +3628,8 @@ def build_app() -> Application:
         per_message=False,
         allow_reentry=True,
     )
-    # Admin sell approve conversation (approve button → enter price)
     sell_approve_conv = ConversationHandler(
+        name="sell_approve",
         entry_points=[CallbackQueryHandler(sell_approve_cb, pattern=r"^sell_approve_\d+$")],
         states={
             SELL_APPROVE_PRICE: [
@@ -3616,8 +3640,8 @@ def build_app() -> Application:
         per_message=False,
         allow_reentry=True,
     )
-    # Admin account price edit conversation
     acc_editprice_conv = ConversationHandler(
+        name="acc_editprice",
         entry_points=[CallbackQueryHandler(acc_editprice_start, pattern=r"^acc_editprice_\d+$")],
         states={
             ACC_EDIT_PRICE: [
