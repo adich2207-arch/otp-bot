@@ -598,60 +598,77 @@ def _parse_payment_email(subject: str, body: str):
     return utr, amount
 
 
-def poll_gmail_for_utr(utr: str, expected_amount_inr: float) -> bool:
+def poll_gmail_for_utr(utr: str, expected_amount_inr: float,
+                       timeout_seconds: int = 120, interval_seconds: int = 8) -> bool:
     """
-    Connect to Gmail via IMAP, search recent UPI credit emails,
-    and return True if a matching UTR + amount is found.
-    Runs synchronously — call in a thread executor from async code.
+    Connect to Gmail via IMAP and repeatedly poll for a matching UPI credit email.
+    Retries every `interval_seconds` for up to `timeout_seconds` (default 120s / 2 min).
+    Returns True immediately when a match is found.
+    Runs synchronously — call via loop.run_in_executor from async code.
     """
+    import time as _t
     if not GMAIL_USER or not GMAIL_APP_PASSWORD:
         return False
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select("INBOX")
 
-        # Search for UPI/credit emails in INBOX (last ~2 days is fine)
-        query = '(SUBJECT "credited" OR SUBJECT "received" OR SUBJECT "UPI" OR SUBJECT "payment")'
-        status, data = mail.search(None, query)
-        if status != "OK" or not data[0]:
+    deadline = _t.monotonic() + timeout_seconds
+    attempt  = 0
+
+    while _t.monotonic() < deadline:
+        attempt += 1
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            mail.select("INBOX")
+
+            # Broad search — cast a wide net so we don't miss any UPI emails
+            query = '(OR OR OR SUBJECT "credited" SUBJECT "received" SUBJECT "UPI" SUBJECT "payment")'
+            status, data = mail.search(None, query)
+            if status == "OK" and data[0]:
+                email_ids = data[0].split()
+                # Check latest 20 emails (more coverage on retry attempts)
+                for eid in reversed(email_ids[-20:]):
+                    try:
+                        status2, msg_data = mail.fetch(eid, "(RFC822)")
+                        if status2 != "OK":
+                            continue
+                        raw = msg_data[0][1]
+                        msg = email.message_from_bytes(raw)
+
+                        # Decode subject safely
+                        raw_subject = msg.get("Subject", "")
+                        parts = decode_header(raw_subject)
+                        subject = ""
+                        for part, enc in parts:
+                            if isinstance(part, bytes):
+                                subject += part.decode(enc or "utf-8", errors="ignore")
+                            else:
+                                subject += str(part)
+
+                        body = _extract_email_body(msg)
+                        found_utr, found_amount = _parse_payment_email(subject, body)
+
+                        if found_utr and found_amount:
+                            utr_match    = found_utr.strip().upper() == utr.strip().upper()
+                            amount_match = abs(found_amount - expected_amount_inr) < 1.0
+                            if utr_match and amount_match:
+                                mail.logout()
+                                logger.info(f"[AutoVerify] Match found on attempt {attempt}: UTR={utr}")
+                                return True
+                    except Exception:
+                        continue
+
             mail.logout()
-            return False
 
-        email_ids = data[0].split()
-        # Check latest 10 emails only for speed
-        for eid in reversed(email_ids[-10:]):
-            status, msg_data = mail.fetch(eid, "(RFC822)")
-            if status != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
+        except Exception as e:
+            logger.warning(f"[AutoVerify] Attempt {attempt} IMAP error: {e}")
 
-            # Decode subject
-            raw_subject = msg.get("Subject", "")
-            parts = decode_header(raw_subject)
-            subject = ""
-            for part, enc in parts:
-                if isinstance(part, bytes):
-                    subject += part.decode(enc or "utf-8", errors="ignore")
-                else:
-                    subject += part
+        # Wait before retrying (don't wait if we've just hit the deadline)
+        remaining = deadline - _t.monotonic()
+        if remaining > 0:
+            _t.sleep(min(interval_seconds, remaining))
 
-            body = _extract_email_body(msg)
-            found_utr, found_amount = _parse_payment_email(subject, body)
-
-            if found_utr and found_amount:
-                utr_match    = found_utr.strip().upper() == utr.strip().upper()
-                amount_match = abs(found_amount - expected_amount_inr) < 1.0  # ±₹1 tolerance
-                if utr_match and amount_match:
-                    mail.logout()
-                    return True
-
-        mail.logout()
-        return False
-    except Exception as e:
-        logger.warning(f"[AutoVerify] Gmail IMAP error: {e}")
-        return False
+    logger.info(f"[AutoVerify] No match found after {attempt} attempts for UTR={utr}")
+    return False
 
 
 # ── DEPOSIT ───────────────────────────────────────────────────────────────────
@@ -815,7 +832,7 @@ async def deposit_utr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 4 — Got screenshot. Verify via Gmail IMAP → auto-approve or reject."""
+    """Step 4 — Got screenshot. Immediately confirm receipt, then verify via Gmail IMAP."""
     user       = update.effective_user
     amount_usd = ctx.user_data.get("dep_amount", 0)
     amount_inr = ctx.user_data.get("dep_amount_inr", round(float(amount_usd) * USD_TO_INR))
@@ -829,27 +846,57 @@ async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     photo_id = update.message.photo[-1].file_id
 
+    # Create deposit record immediately
     with get_db() as conn:
         dep_id = conn.execute(
             "INSERT INTO deposits (user_id, amount) VALUES (%s,%s) RETURNING id",
             (user.id, amount_usd)
         ).fetchone()["id"]
 
-    checking_msg = await update.message.reply_text(
-        f"<b>🔍 Verifying your payment...</b>\n\n"
-        f"<b>💵 Amount:</b> ₹{amount_inr:.0f}\n"
-        f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n\n"
-        f"⏳ <i>Checking payment records, please wait...</i>",
-        parse_mode="HTML")
+    # Generate a human-readable request ID (like FP_timestamp_userid)
+    import time as _time
+    req_id = f"FP_{int(_time.time())}_{user.id}"
+    ctx.user_data["dep_req_id"] = req_id
 
+    # ── Step 1: Send the screenshot back with "PROOF SUBMITTED" confirmation ──
+    await ctx.bot.send_photo(
+        user.id,
+        photo=photo_id,
+        caption=(
+            f"<b>✅ PAYMENT SUBMITTED</b>\n\n"
+            f"┌── ✅ PROOF SUBMITTED ──┐\n"
+            f"│\n"
+            f"│  💰 <b>Amount:</b> ₹{amount_inr:.0f}\n"
+            f"│  🪪 <b>UTR:</b> <code>{utr}</code>\n"
+            f"│  📸 <b>Screenshot:</b> Received\n"
+            f"│  📝 <b>Request:</b> <code>{req_id}</code>\n"
+            f"│\n"
+            f"└──────────────────────┘"
+        ),
+        parse_mode="HTML"
+    )
+
+    # ── Step 2: Send the "Verifying" status message ───────────────────────────
+    verifying_msg = await update.message.reply_text(
+        f"⏳ <b>Verifying payment</b>\n"
+        f"Checking UPI Auto Gmail for your payment ref and amount...\n"
+        f"<i>Usually under 2 minutes. If not found, admin will review manually.</i>",
+        parse_mode="HTML"
+    )
+
+    # ── Step 3: Run Gmail IMAP check — retries every 8s for up to 120s ───────
     loop    = asyncio.get_event_loop()
-    matched = await loop.run_in_executor(None, poll_gmail_for_utr, utr, float(amount_inr))
+    matched = await loop.run_in_executor(
+        None, poll_gmail_for_utr, utr, float(amount_inr), 120, 8
+    )
 
+    # Delete the "verifying" spinner message
     try:
-        await checking_msg.delete()
+        await verifying_msg.delete()
     except Exception:
         pass
 
+    # ── Step 4: Auto-approve or reject based on result ───────────────────────
     if matched:
         with get_db() as conn:
             conn.execute("UPDATE deposits SET status='approved' WHERE id=%s", (dep_id,))
@@ -876,12 +923,14 @@ async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"<b>🎉 Your wallet has been topped up instantly!</b>",
             parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
 
+        # Notify admin with screenshot
         await ctx.bot.send_photo(ADMIN_ID, photo=photo_id, caption=(
             f"<b>✅ AUTO-APPROVED DEPOSIT #{dep_id}</b>\n"
             f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
             f"<b>💵</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
             f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n"
-            f"<b>🤖 Verified via Gmail IMAP</b>"
+            f"<b>📝 Req:</b> <code>{req_id}</code>\n"
+            f"<b>🤖 Verified via Gmail IMAP — auto-credited</b>"
             + (f"\n<b>🤝 Referral:</b> {fmt(commission)} paid" if commission else "")
         ), parse_mode="HTML")
 
@@ -898,7 +947,9 @@ async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML")
             except Exception:
                 pass
+
     else:
+        # Gmail check failed → mark rejected, send screenshot to admin for override
         with get_db() as conn:
             conn.execute("UPDATE deposits SET status='rejected' WHERE id=%s", (dep_id,))
 
@@ -923,11 +974,13 @@ async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Override Approve", callback_data=f"dep_approve_{dep_id}"),
              InlineKeyboardButton("🗑 Dismiss",          callback_data=f"dep_reject_{dep_id}")]
         ])
+        # Send screenshot + details to admin
         await ctx.bot.send_photo(ADMIN_ID, photo=photo_id, caption=(
             f"<b>❌ REJECTED (not verified) #{dep_id}</b>\n"
             f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
             f"<b>💵</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
-            f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n\n"
+            f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n"
+            f"<b>📝 Req:</b> <code>{req_id}</code>\n\n"
             f"⚠️ <i>Gmail IMAP found no match.\nOverride approve only if verified manually.</i>"
         ), parse_mode="HTML", reply_markup=admin_kb)
 
