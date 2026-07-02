@@ -1255,7 +1255,7 @@ async def _watch_for_otp(bot, user_id: int, session_str: str, phone: str, acc_id
 BUY_PAGE_SIZE = 20  # countries per page (2 columns × 10 rows)
 
 async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry — show Server 1 / Server 2 choice with clean names only."""
+    """Entry — show Server 1 / Server 2 choice."""
     query = update.callback_query
     await query.answer()
 
@@ -1265,9 +1265,9 @@ async def buy_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Select a server to browse available accounts:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔵  Server 1", callback_data="buy_server_1"),
-             InlineKeyboardButton("🟢  Server 2", callback_data="buy_server_2")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="menu_back")],
+            [InlineKeyboardButton("Server (1)", callback_data="buy_server_1")],
+            [InlineKeyboardButton("Server (2)", callback_data="buy_server_2")],
+            [InlineKeyboardButton("• back •",   callback_data="menu_back")],
         ])
     )
 
@@ -2358,6 +2358,26 @@ async def withdraw_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     balance = get_balance(query.from_user.id)
+
+    # ── Minimum withdrawal check ($2) ─────────────────────────────────────
+    MIN_WITHDRAWAL_USD = 2.0
+    if balance < MIN_WITHDRAWAL_USD:
+        min_inr = round(MIN_WITHDRAWAL_USD * USD_TO_INR)
+        await query.edit_message_text(
+            f"<b>💸 WITHDRAW</b>\n"
+            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
+            f"<b>❌ Minimum Withdrawal Not Met</b>\n\n"
+            f"<b>💰 Your Balance:</b>     <b>{fmt(balance)}</b>\n"
+            f"<b>📌 Minimum Required:</b> <b>₹{min_inr} ($2.00)</b>\n\n"
+            f"Please recharge your wallet first.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💵  Recharge Wallet", callback_data="menu_deposit")],
+                [InlineKeyboardButton("🔙  Back to Menu",    callback_data="menu_back")],
+            ])
+        )
+        return ConversationHandler.END
+    # ──────────────────────────────────────────────────────────────────────
     await query.edit_message_text(
         f"<b>💸 WITHDRAW</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
@@ -2423,6 +2443,18 @@ async def withdraw_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Convert INR → USD for internal balance comparison and storage
     amount_usd = round(amount_inr / USD_TO_INR, 2)
     balance    = get_balance(user.id)
+
+    # ── Minimum withdrawal check ($2) ─────────────────────────────────────
+    MIN_WITHDRAWAL_USD = 2.0
+    if amount_usd < MIN_WITHDRAWAL_USD:
+        min_inr = round(MIN_WITHDRAWAL_USD * USD_TO_INR)
+        await update.message.reply_text(
+            f"<b>❌ Minimum Withdrawal is ₹{min_inr} ($2.00)</b>\n\n"
+            f"You entered <b>₹{amount_inr:.0f} (${amount_usd:.2f})</b> which is below the minimum.\n\n"
+            f"Please enter at least <b>₹{min_inr}</b>:",
+            parse_mode="HTML")
+        return WITHDRAW_AMOUNT
+    # ──────────────────────────────────────────────────────────────────────
 
     if balance < amount_usd:
         await update.message.reply_text(
