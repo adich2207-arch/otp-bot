@@ -308,28 +308,19 @@ def init_db():
             created_at TIMESTAMPTZ DEFAULT NOW())""")
         conn.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS upi_id TEXT DEFAULT ''")
 
-        # ── Sequence continuity across database resets ────────────────────────
-        # Set STARTING_ACCOUNT_ID / STARTING_DEPOSIT_ID / STARTING_WITHDRAWAL_ID
-        # in your Render env vars so IDs continue from where the last DB left off.
-        # Example: if your last account ID was 47, set STARTING_ACCOUNT_ID=48
-        for env_var, sequence in (
-            ("STARTING_ACCOUNT_ID",    "accounts_id_seq"),
-            ("STARTING_DEPOSIT_ID",    "deposits_id_seq"),
-            ("STARTING_WITHDRAWAL_ID", "withdrawals_id_seq"),
+        # ── Sequence continuity: always advance to max(existing)+1 ──────────
+        # This prevents UniqueViolation on INSERT after a DB restore/reset.
+        for table, sequence in (
+            ("accounts",    "accounts_id_seq"),
+            ("deposits",    "deposits_id_seq"),
+            ("withdrawals", "withdrawals_id_seq"),
         ):
-            raw = os.getenv(env_var, "").strip()
-            if raw:
-                try:
-                    start_val = int(raw)
-                    if start_val > 1:
-                        # setval(seq, val, is_called=false) → next INSERT gets exactly val
-                        conn.execute(
-                            "SELECT setval(%s, %s, false)",
-                            (sequence, start_val)
-                        )
-                        logger.info(f"✅ Sequence {sequence} starting from {start_val}")
-                except (ValueError, Exception) as e:
-                    logger.warning(f"Could not set sequence {sequence} from {env_var}: {e}")
+            try:
+                conn.execute(
+                    f"SELECT setval('{sequence}', COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
+                )
+            except Exception as e:
+                logger.warning(f"Could not advance sequence {sequence}: {e}")
 
     logger.info("✅ Database initialised.")
     # ── Deposit pending sessions (replaces ConversationHandler state) ─────────
@@ -435,22 +426,16 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Silently ignore errors that are NOT real failures ─────────────────────
     # These happen routinely (e.g. user clicks a button on an old message, double-tap, etc.)
-    ignored = (
-        tg_err.BadRequest,        # "Message is not modified", "Query is too old", etc.
-        tg_err.MessageNotModified,
+    # Only tg_err.BadRequest exists in all PTB versions — check by message string instead.
+    benign_strings = (
+        "message is not modified",
+        "query is too old",
+        "message to edit not found",
+        "message can't be edited",
+        "there is no text in the message",
     )
-    if isinstance(err, ignored):
-        msg = str(err).lower()
-        # Only truly ignore the benign ones; let real bad requests bubble up
-        benign = (
-            "message is not modified",
-            "query is too old",
-            "message to edit not found",
-            "message can't be edited",
-            "there is no text in the message",
-        )
-        if any(b in msg for b in benign):
-            return  # completely silent — no user message
+    if isinstance(err, tg_err.BadRequest) and any(b in str(err).lower() for b in benign_strings):
+        return  # completely silent — no user message
 
     logger.error("Exception while handling update:", exc_info=err)
 
