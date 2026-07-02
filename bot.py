@@ -207,7 +207,8 @@ def phone_to_country(phone: str) -> tuple:
 
 ADMIN_2FA_PASSWORD  = 10  # extra state for two-step verification password
 ADMIN_SERVER_SELECT = 11  # extra state: admin picks server after setting price
-DEPOSIT_UTR         = 12  # extra state: user enters UTR for auto-verification
+DEPOSIT_UTR         = 12  # extra state: user enters UTR
+DEPOSIT_PROOF       = 13  # extra state: user sends screenshot after UTR
 
 # ── Payment details (set these in Render env vars) ────────────────────────────
 PAYMENT_UPI    = os.getenv("PAYMENT_UPI", "yourname@upi")
@@ -657,7 +658,7 @@ def poll_gmail_for_utr(utr: str, expected_amount_inr: float) -> bool:
 async def deposit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Step 1 — Ask how much they want to deposit."""
     query = update.callback_query
-    await query.answer()  # answer immediately so Telegram stops the spinner
+    await query.answer()
     await query.edit_message_text(
         f"<b>💵 RECHARGE WALLET</b>\n"
         f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n\n"
@@ -668,8 +669,9 @@ async def deposit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML")
     return DEPOSIT_AMOUNT
 
+
 async def deposit_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 2 — Show UPI + QR code and ask for UTR number."""
+    """Step 2 — Show QR + UPI with I Paid / QR Not Working / Cancel buttons."""
     user = update.effective_user
     ensure_user(user.id, user.username or "")
     try:
@@ -682,206 +684,264 @@ async def deposit_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML")
         return DEPOSIT_AMOUNT
 
-    # Convert INR → USD for internal storage (DB always stores USD)
     amount_usd = round(amount_inr / USD_TO_INR, 2)
     ctx.user_data["dep_amount"]     = amount_usd
     ctx.user_data["dep_amount_inr"] = amount_inr
 
-    utr_line = (
-        "\n\n<b>3️⃣  After paying, send your <u>UTR / Reference Number</u> here.</b>\n"
-        "📌 <i>Find it in your UPI app → Transaction Details → UTR No / Ref ID (12-digit number)</i>"
-        if GMAIL_USER else
-        "\n\n<b>3️⃣  After paying, send a <u>screenshot</u> of your payment here.</b>"
+    caption = (
+        f"⚡ <b>Pay ₹{amount_inr:.0f} — UPI Auto</b>\n\n"
+        f"� Scan QR code below (works on all UPI apps)\n"
+        f"🪙 <b>UPI ID:</b> <code>{PAYMENT_UPI}</code>\n"
+        f"──────────────────────\n"
+        f"• <b>Amount:</b> ₹{amount_inr:.0f}\n"
+        f"• <b>Expires:</b> 30 minutes\n\n"
+        f"📝 <b>Steps:</b>\n"
+        f"1. Scan QR or send ₹{amount_inr:.0f} to UPI ID above\n"
+        f"2. Tap <b>💰 I Paid ✅</b> after payment\n"
+        f"3. Submit UTR (12 digit) or TXN ID + screenshot"
     )
-
-    msg = (
-        f"<b>💵 Amount to Pay: ₹{amount_inr:.0f} (${amount_usd:.2f})</b>\n\n"
-        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-        f"<b>📲 Step 1 — Pay via UPI:</b>\n"
-        f"<code>{PAYMENT_UPI}</code>\n\n"
-        f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>"
-        f"{utr_line}"
-    )
-
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰  I Paid ✅",       callback_data="dep_ipaid")],
+        [InlineKeyboardButton("📷  QR Not Working?", callback_data="dep_qrnw")],
+        [InlineKeyboardButton("❌  Cancel",          callback_data="dep_cancel")],
+    ])
     if PAYMENT_QR:
-        await update.message.reply_photo(photo=PAYMENT_QR, caption=msg, parse_mode="HTML")
+        await update.message.reply_photo(photo=PAYMENT_QR, caption=caption,
+                                         parse_mode="HTML", reply_markup=kb)
     elif os.path.isfile(PAYMENT_QR_PATH):
         with open(PAYMENT_QR_PATH, "rb") as qr_file:
-            await update.message.reply_photo(photo=qr_file, caption=msg, parse_mode="HTML")
+            await update.message.reply_photo(photo=qr_file, caption=caption,
+                                             parse_mode="HTML", reply_markup=kb)
     else:
-        await update.message.reply_text(msg, parse_mode="HTML")
+        await update.message.reply_text(caption, parse_mode="HTML", reply_markup=kb)
+    return DEPOSIT_AMOUNT  # wait for inline button tap
 
-    # Route to UTR entry if Gmail is configured, otherwise fall back to screenshot
-    return DEPOSIT_UTR if GMAIL_USER else DEPOSIT_SCREENSHOT
+
+async def deposit_ipaid_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped '💰 I Paid ✅' — ask for UTR / TXN ID."""
+    query = update.callback_query
+    await query.answer()
+    prompt = (
+        f"<b>✏️ ENTER PAYMENT REF</b>\n\n"
+        f"┌── ✏️ STEP 1/2 ──┐\n"
+        f"│\n"
+        f"│  Send <b>12-digit UTR</b> (bank/UPI app) <b>OR</b>\n"
+        f"│  <b>TXN ID</b> (e.g. <code>FMPIB...</code>) from payment screen.\n"
+        f"│\n"
+        f"└──────────────────────┘\n\n"
+        f"💡 <i>Send /cancel to abort</i>"
+    )
+    try:
+        await query.edit_message_caption(caption=prompt, parse_mode="HTML")
+    except Exception:
+        try:
+            await query.edit_message_text(prompt, parse_mode="HTML")
+        except Exception:
+            await ctx.bot.send_message(query.from_user.id, prompt, parse_mode="HTML")
+    return DEPOSIT_UTR
+
+
+async def deposit_qrnw_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped 'QR Not Working?' — show UPI text payment option."""
+    query = update.callback_query
+    await query.answer()
+    amount_inr = ctx.user_data.get("dep_amount_inr", 0)
+    msg = (
+        f"<b>📲 Pay Manually via UPI</b>\n\n"
+        f"Open any UPI app and send <b>₹{amount_inr:.0f}</b> to:\n\n"
+        f"<code>{PAYMENT_UPI}</code>\n\n"
+        f"After paying, tap <b>💰 I Paid ✅</b> below."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰  I Paid ✅", callback_data="dep_ipaid")],
+        [InlineKeyboardButton("❌  Cancel",    callback_data="dep_cancel")],
+    ])
+    try:
+        await query.edit_message_caption(caption=msg, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await query.edit_message_text(msg, parse_mode="HTML", reply_markup=kb)
+    return DEPOSIT_AMOUNT
+
+
+async def deposit_cancel_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User tapped ❌ Cancel on the payment message."""
+    query = update.callback_query
+    await query.answer("Cancelled.")
+    try:
+        await query.edit_message_caption(caption="❌ <b>Recharge cancelled.</b>", parse_mode="HTML")
+    except Exception:
+        try:
+            await query.edit_message_text("❌ <b>Recharge cancelled.</b>", parse_mode="HTML")
+        except Exception:
+            pass
+    await ctx.bot.send_message(query.from_user.id, "❌ <b>Recharge cancelled.</b>",
+                               parse_mode="HTML",
+                               reply_markup=main_menu_keyboard(query.from_user.id))
+    return ConversationHandler.END
 
 
 async def deposit_utr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 3 (auto-verify path) — User sent UTR. Poll Gmail and auto-approve if matched."""
-    user       = update.effective_user
-    amount_usd = ctx.user_data.get("dep_amount", 0)
-    amount_inr = ctx.user_data.get("dep_amount_inr", round(float(amount_usd) * USD_TO_INR))
-
-    if not update.message.text:
+    """Step 3 — Got UTR/TXN ID, now ask for payment screenshot."""
+    user = update.effective_user
+    if not update.message or not update.message.text:
         await update.message.reply_text(
-            "<b>❌ Please send your UTR / Reference Number as text.</b>\n"
+            "<b>❌ Please send your UTR or TXN ID as text.</b>\n"
             "📌 Example: <code>612345678901</code>",
             parse_mode="HTML")
         return DEPOSIT_UTR
 
-    utr = update.message.text.strip().replace(" ", "").upper()
-
-    # Basic validation: 10–22 alphanumeric characters
-    if not re.match(r"^[A-Z0-9]{10,22}$", utr):
+    raw = update.message.text.strip().replace(" ", "").upper()
+    if not re.match(r"^[A-Z0-9]{6,30}$", raw):
         await update.message.reply_text(
-            "<b>❌ Invalid UTR format.</b>\n\n"
-            "UTR is usually a 12-digit number (e.g. <code>612345678901</code>).\n"
-            "Find it in your UPI app under Transaction Details.",
+            "<b>❌ Invalid ID format.</b>\n\n"
+            "• UTR: 12-digit number — e.g. <code>612345678901</code>\n"
+            "• TXN ID: alphanumeric — e.g. <code>FMPIB7978114324</code>\n\n"
+            "Please send the correct ID:",
             parse_mode="HTML")
         return DEPOSIT_UTR
 
-    # Create a PENDING deposit record first (so admin can still approve if auto-verify fails)
+    ctx.user_data["dep_utr"] = raw
+    await update.message.reply_text(
+        f"<b>✅ UTR / TXN ID received:</b> <code>{raw}</code>\n\n"
+        f"┌── 📸 STEP 2/2 ──┐\n"
+        f"│\n"
+        f"│  Now send the <b>screenshot</b> of your\n"
+        f"│  payment confirmation from your UPI app.\n"
+        f"│\n"
+        f"└──────────────────────┘\n\n"
+        f"💡 <i>Send /cancel to abort</i>",
+        parse_mode="HTML")
+    return DEPOSIT_PROOF
+
+
+async def deposit_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 4 — Got screenshot. Verify via Gmail IMAP → auto-approve or reject."""
+    user       = update.effective_user
+    amount_usd = ctx.user_data.get("dep_amount", 0)
+    amount_inr = ctx.user_data.get("dep_amount_inr", round(float(amount_usd) * USD_TO_INR))
+    utr        = ctx.user_data.get("dep_utr", "")
+
+    if not update.message.photo:
+        await update.message.reply_text(
+            "<b>❌ Please send a screenshot photo</b> of your payment confirmation.",
+            parse_mode="HTML")
+        return DEPOSIT_PROOF
+
+    photo_id = update.message.photo[-1].file_id
+
     with get_db() as conn:
         dep_id = conn.execute(
             "INSERT INTO deposits (user_id, amount) VALUES (%s,%s) RETURNING id",
             (user.id, amount_usd)
         ).fetchone()["id"]
 
-    # Tell user we're checking
     checking_msg = await update.message.reply_text(
-        f"<b>🔍 Verifying payment...</b>\n\n"
+        f"<b>🔍 Verifying your payment...</b>\n\n"
         f"<b>💵 Amount:</b> ₹{amount_inr:.0f}\n"
-        f"<b>🔑 UTR:</b> <code>{utr}</code>\n\n"
-        f"⏳ <i>Checking your payment email, please wait...</i>",
+        f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n\n"
+        f"⏳ <i>Checking payment records, please wait...</i>",
         parse_mode="HTML")
 
-    # Run blocking IMAP call in a thread so the bot stays responsive
     loop    = asyncio.get_event_loop()
-    matched = await loop.run_in_executor(
-        None, poll_gmail_for_utr, utr, float(amount_inr)
-    )
+    matched = await loop.run_in_executor(None, poll_gmail_for_utr, utr, float(amount_inr))
+
+    try:
+        await checking_msg.delete()
+    except Exception:
+        pass
 
     if matched:
-        # ── AUTO-APPROVE ──────────────────────────────────────────────────────
         with get_db() as conn:
             conn.execute("UPDATE deposits SET status='approved' WHERE id=%s", (dep_id,))
-            conn.execute(
-                "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                (amount_usd, user.id)
-            )
+            conn.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                         (amount_usd, user.id))
             referrer = conn.execute(
-                "SELECT referred_by FROM users WHERE user_id=%s", (user.id,)
-            ).fetchone()
+                "SELECT referred_by FROM users WHERE user_id=%s", (user.id,)).fetchone()
             commission = 0.0
             if referrer and referrer["referred_by"]:
                 commission = float(amount_usd) * REFERRAL_COMMISSION
-                conn.execute(
-                    "UPDATE users SET balance=balance+%s WHERE user_id=%s",
-                    (commission, referrer["referred_by"])
-                )
+                conn.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s",
+                             (commission, referrer["referred_by"]))
                 conn.execute(
                     "INSERT INTO referral_earnings (referrer_id,referred_id,deposit_id,commission) "
                     "VALUES (%s,%s,%s,%s)",
-                    (referrer["referred_by"], user.id, dep_id, commission)
-                )
-
-        try:
-            await checking_msg.delete()
-        except Exception:
-            pass
+                    (referrer["referred_by"], user.id, dep_id, commission))
 
         await update.message.reply_text(
-            f"<b>✅ Payment Verified Automatically!</b>\n\n"
+            f"<b>✅ Payment Verified &amp; Approved!</b>\n\n"
             f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"<b>💵 Amount Credited: ₹{amount_inr:.0f} (${amount_usd:.2f})</b>\n"
-            f"<b>🔑 UTR:</b> <code>{utr}</code>\n"
+            f"<b>💵 Credited:</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
+            f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n"
             f"<b>🆔 Ref ID:</b> <code>{dep_id}</code>\n\n"
             f"<b>🎉 Your wallet has been topped up instantly!</b>",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard(user.id))
+            parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
 
-        # Notify admin silently
-        await ctx.bot.send_message(
-            ADMIN_ID,
+        await ctx.bot.send_photo(ADMIN_ID, photo=photo_id, caption=(
             f"<b>✅ AUTO-APPROVED DEPOSIT #{dep_id}</b>\n"
-            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"<b>👤 User:</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
-            f"<b>💵 Amount:</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
-            f"<b>🔑 UTR:</b> <code>{utr}</code>\n"
+            f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
+            f"<b>💵</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
+            f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n"
             f"<b>🤖 Verified via Gmail IMAP</b>"
-            + (f"\n<b>🤝 Referral:</b> {fmt(commission)} paid" if commission else ""),
-            parse_mode="HTML")
+            + (f"\n<b>🤝 Referral:</b> {fmt(commission)} paid" if commission else "")
+        ), parse_mode="HTML")
 
         await send_to_channel(ctx.bot, TRADES_CHANNEL,
-            f"╔══════════════════════╗\n"
-            f"║  ✅  AUTO DEPOSIT       ║\n"
-            f"╚══════════════════════╝\n\n"
-            f"🆔  <b>Ref ID:</b>  <code>#{dep_id}</code>\n"
-            f"👤  <b>User:</b>    <code>{user.id}</code>\n"
-            f"💵  <b>Amount:</b>  <b>₹{amount_inr:.0f} (${amount_usd:.2f})</b>\n"
-            f"🔑  <b>UTR:</b>    <code>{utr}</code>\n"
-            f"📊  <b>Status:</b>  ✅ <i>Auto-Verified &amp; Credited</i>"
-        )
+            f"╔══════════════════════╗\n║  ✅  AUTO DEPOSIT       ║\n╚══════════════════════╝\n\n"
+            f"🆔 <code>#{dep_id}</code>  👤 <code>{user.id}</code>\n"
+            f"💵 <b>₹{amount_inr:.0f} (${amount_usd:.2f})</b>  🔑 <code>{utr}</code>\n"
+            f"📊 ✅ <i>Auto-Verified &amp; Credited</i>")
 
         if referrer and referrer["referred_by"] and commission > 0:
             try:
-                await ctx.bot.send_message(
-                    referrer["referred_by"],
-                    f"<b>💰 Referral Commission Earned!</b>\n\nYou earned <b>{fmt(commission)}</b>!",
+                await ctx.bot.send_message(referrer["referred_by"],
+                    f"<b>💰 Referral Commission!</b>\n\nYou earned <b>{fmt(commission)}</b>!",
                     parse_mode="HTML")
             except Exception:
                 pass
-
     else:
-        # ── AUTO-VERIFY FAILED → send to admin for manual review ─────────────
-        try:
-            await checking_msg.delete()
-        except Exception:
-            pass
-
-        admin_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Approve", callback_data=f"dep_approve_{dep_id}"),
-             InlineKeyboardButton("❌ Reject",  callback_data=f"dep_reject_{dep_id}")]
-        ])
-        await ctx.bot.send_message(
-            ADMIN_ID,
-            f"<b>📥 DEPOSIT — MANUAL REVIEW NEEDED</b>\n"
-            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"<b>👤 User:</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
-            f"<b>💵 Amount:</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
-            f"<b>🔑 UTR:</b> <code>{utr}</code>\n"
-            f"<b>🆔 Deposit ID:</b> <code>{dep_id}</code>\n"
-            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"⚠️ <i>Could not auto-verify via Gmail. Please check manually.</i>",
-            parse_mode="HTML",
-            reply_markup=admin_kb)
-
-        await send_to_channel(ctx.bot, TRADES_CHANNEL,
-            f"╔══════════════════════╗\n"
-            f"║  📥  DEPOSIT REQUEST    ║\n"
-            f"╚══════════════════════╝\n\n"
-            f"🆔  <b>Ref ID:</b>  <code>#{dep_id}</code>\n"
-            f"👤  <b>User:</b>    <code>{user.id}</code>\n"
-            f"💵  <b>Amount:</b>  <b>₹{amount_inr:.0f} (${amount_usd:.2f})</b>\n"
-            f"🔑  <b>UTR:</b>    <code>{utr}</code>\n"
-            f"📊  <b>Status:</b>  ⏳ <i>Awaiting Manual Review</i>"
-        )
+        with get_db() as conn:
+            conn.execute("UPDATE deposits SET status='rejected' WHERE id=%s", (dep_id,))
 
         await update.message.reply_text(
-            f"<b>⏳ Sent for Manual Review</b>\n\n"
+            f"<b>❌ Payment Not Verified</b>\n\n"
             f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"<b>💵 Amount:</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
-            f"<b>🔑 UTR:</b> <code>{utr}</code>\n"
-            f"<b>🆔 Ref ID:</b> <code>{dep_id}</code>\n\n"
-            f"⚠️ <i>Auto-verification could not confirm this payment yet.\n"
-            f"Admin will manually review and credit your wallet shortly.</i>",
+            f"<b>💵 Amount:</b> ₹{amount_inr:.0f}  •  <b>UTR/TXN:</b> <code>{utr}</code>\n\n"
+            f"⚠️ No matching payment found.\n\n"
+            f"Please check:\n"
+            f"• UTR/TXN ID is correct\n"
+            f"• Payment was sent to <code>{PAYMENT_UPI}</code>\n"
+            f"• Amount matches exactly\n\n"
+            f"Contact support if you believe this is an error.",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(user.id))
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄  Try Again", callback_data="menu_deposit")],
+                [InlineKeyboardButton("🆘  Support",   url=f"https://t.me/{SUPPORT_USERNAME}")],
+                [InlineKeyboardButton("🔙  Main Menu", callback_data="menu_back")],
+            ]))
+
+        admin_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Override Approve", callback_data=f"dep_approve_{dep_id}"),
+             InlineKeyboardButton("🗑 Dismiss",          callback_data=f"dep_reject_{dep_id}")]
+        ])
+        await ctx.bot.send_photo(ADMIN_ID, photo=photo_id, caption=(
+            f"<b>❌ REJECTED (not verified) #{dep_id}</b>\n"
+            f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
+            f"<b>💵</b> ₹{amount_inr:.0f} (${amount_usd:.2f})\n"
+            f"<b>🔑 UTR/TXN:</b> <code>{utr}</code>\n\n"
+            f"⚠️ <i>Gmail IMAP found no match.\nOverride approve only if verified manually.</i>"
+        ), parse_mode="HTML", reply_markup=admin_kb)
+
+        await send_to_channel(ctx.bot, TRADES_CHANNEL,
+            f"╔══════════════════════╗\n║  ❌  DEPOSIT REJECTED   ║\n╚══════════════════════╝\n\n"
+            f"🆔 <code>#{dep_id}</code>  👤 <code>{user.id}</code>\n"
+            f"💵 <b>₹{amount_inr:.0f}</b>  🔑 <code>{utr}</code>\n"
+            f"📊 ❌ <i>Not Verified</i>")
 
     return ConversationHandler.END
 
 
 async def deposit_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Step 3 (fallback path — no Gmail configured) — Receive screenshot, notify admin."""
+    """Fallback — only used when Gmail is NOT configured (screenshot-only manual mode)."""
     user       = update.effective_user
     amount     = ctx.user_data.get("dep_amount", 0)
     amount_inr = ctx.user_data.get("dep_amount_inr", round(float(amount) * USD_TO_INR))
@@ -893,49 +953,33 @@ async def deposit_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return DEPOSIT_SCREENSHOT
 
     photo_id = update.message.photo[-1].file_id
-
     with get_db() as conn:
         dep_id = conn.execute(
             "INSERT INTO deposits (user_id, amount) VALUES (%s,%s) RETURNING id",
-            (user.id, amount)
-        ).fetchone()["id"]
+            (user.id, amount)).fetchone()["id"]
 
     admin_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Approve", callback_data=f"dep_approve_{dep_id}"),
          InlineKeyboardButton("❌ Reject",  callback_data=f"dep_reject_{dep_id}")]
     ])
-    await ctx.bot.send_photo(
-        ADMIN_ID,
-        photo=photo_id,
-        caption=(
-            f"<b>📥 NEW DEPOSIT REQUEST</b>\n"
-            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"<b>👤 User:</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
-            f"<b>💵 Amount:</b> ₹{amount_inr:.0f} (${amount:.2f})\n"
-            f"<b>🆔 Deposit ID:</b> <code>{dep_id}</code>\n"
-            f"<b>▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰</b>\n"
-            f"📸 <b>Payment screenshot attached.</b>"
-        ),
-        parse_mode="HTML",
-        reply_markup=admin_kb)
+    await ctx.bot.send_photo(ADMIN_ID, photo=photo_id, caption=(
+        f"<b>📥 NEW DEPOSIT REQUEST</b>\n"
+        f"<b>👤</b> @{user.username or user.first_name} (<code>{user.id}</code>)\n"
+        f"<b>💵</b> ₹{amount_inr:.0f} (${amount:.2f})\n"
+        f"<b>🆔</b> Deposit ID: <code>{dep_id}</code>\n"
+        f"📸 Screenshot attached."
+    ), parse_mode="HTML", reply_markup=admin_kb)
 
     await send_to_channel(ctx.bot, TRADES_CHANNEL,
-        f"╔══════════════════════╗\n"
-        f"║  📥  DEPOSIT REQUEST    ║\n"
-        f"╚══════════════════════╝\n\n"
-        f"🆔  <b>Ref ID:</b>  <code>#{dep_id}</code>\n"
-        f"👤  <b>User:</b>    <code>{user.id}</code>\n"
-        f"💵  <b>Amount:</b>  <b>₹{amount_inr:.0f} (${amount:.2f})</b>\n"
-        f"📊  <b>Status:</b>  ⏳ <i>Awaiting Verification</i>"
-    )
+        f"╔══════════════════════╗\n║  📥  DEPOSIT REQUEST    ║\n╚══════════════════════╝\n\n"
+        f"🆔 <code>#{dep_id}</code>  👤 <code>{user.id}</code>\n"
+        f"💵 <b>₹{amount_inr:.0f} (${amount:.2f})</b>\n📊 ⏳ <i>Awaiting Verification</i>")
 
     await update.message.reply_text(
         f"<b>✅ Screenshot Received!</b>\n\n"
-        f"<b>💵 Amount:</b> ₹{amount_inr:.0f} (${amount:.2f})\n"
-        f"<b>🆔 Reference ID:</b> <code>{dep_id}</code>\n\n"
-        f"⏳ <b>Admin will verify and credit your balance shortly.</b>",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard(user.id))
+        f"<b>💵</b> ₹{amount_inr:.0f}  •  <b>🆔 Ref:</b> <code>{dep_id}</code>\n\n"
+        f"⏳ Admin will verify and credit your balance shortly.",
+        parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
     return ConversationHandler.END
 async def dep_approve_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Admin taps ✅ Approve on deposit message."""
@@ -3443,8 +3487,14 @@ def build_app() -> Application:
     deposit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(deposit_start, pattern="^menu_deposit$")],
         states={
-            DEPOSIT_AMOUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_amount)],
-            DEPOSIT_UTR:        [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_utr)],
+            DEPOSIT_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_amount),
+                CallbackQueryHandler(deposit_ipaid_cb,  pattern="^dep_ipaid$"),
+                CallbackQueryHandler(deposit_qrnw_cb,   pattern="^dep_qrnw$"),
+                CallbackQueryHandler(deposit_cancel_cb, pattern="^dep_cancel$"),
+            ],
+            DEPOSIT_UTR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, deposit_utr)],
+            DEPOSIT_PROOF:  [MessageHandler(filters.PHOTO, deposit_proof)],
             DEPOSIT_SCREENSHOT: [MessageHandler(filters.PHOTO, deposit_screenshot)],
         },
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False)
